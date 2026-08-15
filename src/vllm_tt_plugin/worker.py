@@ -767,16 +767,46 @@ def get_reliability_mode(tt_config):
 # Set fabric config to passed in value
 # Do nothing if not set
 # Must be called before creating the mesh device
+def get_fabric_router_config(tt_config):
+    """Optional fabric router tuning from the TT plugin config.
+
+    ``fabric_packet_payload_bytes`` sets the router's maximum packet payload. It
+    matters because a model whose collectives were tuned (and whose accuracy and
+    latency evidence was collected) at one payload size runs its serving path at
+    the runtime default otherwise, which is a silent difference between the
+    offline and served configurations. Returns ``None`` when the key is absent so
+    the runtime default is left untouched.
+    """
+    if not tt_config or "fabric_packet_payload_bytes" not in tt_config:
+        return None
+    payload = int(tt_config["fabric_packet_payload_bytes"])
+    assert payload > 0, f"fabric_packet_payload_bytes must be positive, got {payload}"
+    router_config = ttnn.FabricRouterConfig()
+    router_config.max_packet_payload_size_bytes = payload
+    return router_config
+
+
 def set_fabric(tt_config, num_devices):
     fabric_config = get_fabric_config(tt_config, num_devices)
     if fabric_config:
         reliability_mode = get_reliability_mode(tt_config)
+        router_config = get_fabric_router_config(tt_config)
         logger.info(
-            "Setting fabric config: %s, reliability mode: %s",
+            "Setting fabric config: %s, reliability mode: %s, router config: %s",
             fabric_config,
             reliability_mode,
+            (
+                tt_config.get("fabric_packet_payload_bytes")
+                if router_config is not None
+                else "default"
+            ),
         )
-        ttnn.set_fabric_config(fabric_config, reliability_mode)
+        if router_config is not None:
+            ttnn.set_fabric_config(
+                fabric_config, reliability_mode, router_config=router_config
+            )
+        else:
+            ttnn.set_fabric_config(fabric_config, reliability_mode)
 
 
 # From tt-metal/conftest.py:

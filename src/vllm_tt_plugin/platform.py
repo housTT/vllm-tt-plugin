@@ -670,6 +670,33 @@ def register_tt_models(register_test_models=False) -> None:
     ):
         _register_model_if_missing(ModelRegistry, arch, _gemma4_target)
 
+    # Muse-Glimmer — text-only TT bridge for a nested-config checkpoint.
+    #
+    # Same shape of problem as Gemma4 above: the checkpoint declares
+    # ``MuseGlimmerForConditionalGeneration`` with ``model_type: muse_glimmer``
+    # and nested text/vision configs, so ``hf_config != hf_text_config`` and
+    # upstream's architecture resolver would fall back to
+    # ``TransformersMultiModalForCausalLM`` in ``ModelConfig.__post_init__`` —
+    # which runs *before* this plugin's ``TT``-prefix rewrite, so the prefixed
+    # name alone cannot help. Registering the plain HF architecture name makes
+    # upstream resolution find the TT class directly; the ``TT``-prefixed alias
+    # then satisfies ``check_and_update_config``'s registry check.
+    #
+    # The TT port implements the text decoder only and its class does not use
+    # ``SupportsMultiModal``, so ``_model_info.supports_multimodal`` is False,
+    # ``multimodal_config`` stays unpopulated, and the request path is text-only.
+    _muse_glimmer_target = (
+        "models.autoports.meta_models_muse_glimmer_30b.tt.generator_vllm"
+        ":MuseGlimmerForConditionalGeneration"
+    )
+    for arch in (
+        "MuseGlimmerForConditionalGeneration",
+        "MuseGlimmerForCausalLM",
+        "TTMuseGlimmerForConditionalGeneration",
+        "TTMuseGlimmerForCausalLM",
+    ):
+        _register_model_if_missing(ModelRegistry, arch, _muse_glimmer_target)
+
     # DeepseekV3
     _register_model_if_missing(
         ModelRegistry,
