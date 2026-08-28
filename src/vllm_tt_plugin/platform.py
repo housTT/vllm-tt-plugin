@@ -643,6 +643,20 @@ def register_tt_models(register_test_models=False) -> None:
         ModelRegistry, "TTQwen3_5ForConditionalGeneration", path_qwen35_text
     )
 
+    # Qwen3.8-Flash-Next identifies its text model as Qwen4Exp and carries a
+    # nested text_config. Register the plain architecture before vLLM's nested
+    # config fallback can classify it as a generic Transformers model, then
+    # register the TT-prefixed alias used by check_and_update_config().
+    _qwen38_target = (
+        "models.autoports.qwen_qwen3_8_flash_next.tt.generator_vllm:"
+        "Qwen4ExpForConditionalGeneration"
+    )
+    for arch in (
+        "Qwen4ExpForConditionalGeneration",
+        "TTQwen4ExpForConditionalGeneration",
+    ):
+        _register_model_if_missing(ModelRegistry, arch, _qwen38_target)
+
     # Qwen2.5 - Vision
     _register_model_if_missing(
         ModelRegistry,
@@ -874,6 +888,19 @@ class TTPlatform(Platform):
         MAX_TOP_K = 20
 
         model_config = vllm_config.model_config
+        # Transformers names Qwen4Exp's sparse-attention blocks
+        # ``qwen_sparse_attention`` at runtime, while vLLM's hybrid layer
+        # counter recognizes the serialized checkpoint name
+        # ``full_attention``. Normalize only this model's equivalent spelling
+        # so the worker allocates 12 QSA caches instead of zero (or all 48).
+        hf_text_config = model_config.hf_text_config
+        if getattr(hf_text_config, "model_type", None) == "qwen4_exp_text":
+            layer_types = list(getattr(hf_text_config, "layer_types", ()))
+            if "qwen_sparse_attention" in layer_types:
+                hf_text_config.layer_types = [
+                    "full_attention" if kind == "qwen_sparse_attention" else kind
+                    for kind in layer_types
+                ]
         if model_config.max_logprobs > MAX_TOP_K:
             logger.warning(
                 "max_logprobs=%d exceeds TT device limit of %d, clamping to %d",
@@ -982,6 +1009,42 @@ class TTPlatform(Platform):
         # Get model capabilities from the class
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
+        )
+
+        # Qwen4-Exp uses interleaved MRoPE sections for ordinary text RoPE,
+        # where all position axes advance identically.  vLLM's generic
+        # ``uses_mrope`` check interprets the section metadata as multimodal
+        # request-specific RoPE and expects the model to return rope deltas.
+        # Text-only TT adapters can opt out explicitly; retain the rotary
+        # factor/theta/type while removing only the request-specific markers.
+        supports_request_specific_rope = (
+            model_capabilities.get("supports_request_specific_rope", True)
+            if model_capabilities
+            else True
+        )
+        if (
+            not supports_request_specific_rope
+            and getattr(hf_text_config, "model_type", None) == "qwen4_exp_text"
+        ):
+            for field in ("rope_parameters", "rope_scaling"):
+                parameters = getattr(hf_text_config, field, None)
+                if isinstance(parameters, dict) and "mrope_section" in parameters:
+                    parameters = dict(parameters)
+                    parameters.pop("mrope_section", None)
+                    parameters.pop("mrope_interleaved", None)
+                    setattr(hf_text_config, field, parameters)
+            if model_config.uses_mrope:
+                raise ValueError("Qwen4-Exp text-only RoPE normalization did not take effect")
+
+        cls.supports_device_sampling_penalties = (
+            model_capabilities.get("supports_device_sampling_penalties", True)
+            if model_capabilities
+            else True
+        )
+        cls.device_sampling_max_top_k = (
+            model_capabilities.get("device_sampling_max_top_k")
+            if model_capabilities
+            else None
         )
 
         # A model either supports the full on-device sampling pipeline or it

@@ -160,6 +160,12 @@ class TTModelRunner:
         self.supports_topk_logprobs = (
             self.model_config.hf_config.model_type == "gpt_oss"
         )
+        self.supports_device_sampling_penalties = getattr(
+            TTPlatform, "supports_device_sampling_penalties", True
+        )
+        self.device_sampling_max_top_k = getattr(
+            TTPlatform, "device_sampling_max_top_k", None
+        )
 
         logger.info(
             "TTModelRunner: trace_mode=%s, "
@@ -1783,6 +1789,24 @@ class TTModelRunner:
         )
         if has_always_host_only_sampling_params:
             return False
+
+        if not self.supports_device_sampling_penalties and not input_batch.no_penalties:
+            return False
+
+        # A model may expose only a bounded canonical top-k device sampler.
+        # Greedy requests remain valid regardless of vLLM's top_k=0 sentinel;
+        # random requests outside the declared bound use the explicit host
+        # compatibility path and receive full logits.
+        if self.device_sampling_max_top_k is not None:
+            active = slice(0, input_batch.num_reqs)
+            temperature = input_batch.sampling.temperature[active]
+            top_k = input_batch.sampling.top_k[active]
+            random = temperature != 0
+            unsupported_top_k = (top_k < 1) | (
+                top_k > self.device_sampling_max_top_k
+            )
+            if bool(torch.any(random & unsupported_top_k)):
+                return False
 
         # Structured outputs are not supported on device yet
         # https://github.com/tenstorrent/vllm/issues/277
