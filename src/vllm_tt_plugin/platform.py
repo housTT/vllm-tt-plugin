@@ -893,7 +893,11 @@ class TTPlatform(Platform):
         # counter recognizes the serialized checkpoint name
         # ``full_attention``. Normalize only this model's equivalent spelling
         # so the worker allocates 12 QSA caches instead of zero (or all 48).
-        hf_text_config = model_config.hf_text_config
+        # Lightweight/fake ModelConfig objects used by platform callers and
+        # tests need not expose the transformers-only text-config view.  The
+        # normalization is Qwen4-Exp-specific, so absence means there is
+        # nothing to rewrite.
+        hf_text_config = getattr(model_config, "hf_text_config", None)
         if getattr(hf_text_config, "model_type", None) == "qwen4_exp_text":
             layer_types = list(getattr(hf_text_config, "layer_types", ()))
             if "qwen_sparse_attention" in layer_types:
@@ -1034,7 +1038,9 @@ class TTPlatform(Platform):
                     parameters.pop("mrope_interleaved", None)
                     setattr(hf_text_config, field, parameters)
             if model_config.uses_mrope:
-                raise ValueError("Qwen4-Exp text-only RoPE normalization did not take effect")
+                raise ValueError(
+                    "Qwen4-Exp text-only RoPE normalization did not take effect"
+                )
 
         cls.supports_device_sampling_penalties = (
             model_capabilities.get("supports_device_sampling_penalties", True)
@@ -1045,6 +1051,31 @@ class TTPlatform(Platform):
             model_capabilities.get("device_sampling_max_top_k")
             if model_capabilities
             else None
+        )
+        # Some bounded TT samplers are deterministic internally but do not
+        # implement the same seeded RNG algorithm as vLLM's host sampler.  Such
+        # models can opt into one explicit host compatibility route for seeded
+        # stochastic requests, making output independent of which other request
+        # happens to share the cohort.
+        cls.force_host_seeded_sampling = (
+            model_capabilities.get("force_host_seeded_sampling", False)
+            if model_capabilities
+            else False
+        )
+        # Virtual-state models execute a logical multi-user batch over a smaller
+        # physical trace batch.  The runner must preserve their stable request ->
+        # state-slot ownership instead of physically gathering state into row order.
+        cls.supports_virtual_state_slots = (
+            model_capabilities.get("supports_virtual_state_slots", False)
+            if model_capabilities
+            else False
+        )
+        cls.supports_intermediate_prefill_device_sampling = (
+            model_capabilities.get(
+                "supports_intermediate_prefill_device_sampling", False
+            )
+            if model_capabilities
+            else False
         )
 
         # A model either supports the full on-device sampling pipeline or it

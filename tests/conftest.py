@@ -13,6 +13,9 @@ _TT_PLATFORM_CONFIG_ATTRS = (
     "_standard_dp_mesh_grids",
     "sample_on_device_mode",
     "always_compat_sampling",
+    "force_host_seeded_sampling",
+    "supports_virtual_state_slots",
+    "supports_intermediate_prefill_device_sampling",
 )
 
 

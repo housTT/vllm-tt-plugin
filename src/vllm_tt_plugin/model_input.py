@@ -126,6 +126,15 @@ class TTModelInput:
     # single-process DP (supplied by the scheduler-owned step plan), local otherwise.
     prefill_empty_slots: list[int] | None = None
 
+    # Virtual-state models keep request-owned model state in stable device slots
+    # while the persistent vLLM batch is free to condense/reorder its rows.  These
+    # vectors contain real rows only (never the fixed-shape decode padding tail) and
+    # are aligned with ``unpadded_batch_size``.  Non-virtual models ignore them and
+    # continue to consume ``slot_remap``/``prefill_empty_slots`` above.
+    request_ids: list[str] | None = None
+    state_slot_ids: list[int] | None = None
+    state_slot_generations: list[int] | None = None
+
     # Prefill only: rows whose forward writes KV state but must not emit a
     # sampled token, because more prompt tokens remain after this chunk.
     # ``None`` for decode.

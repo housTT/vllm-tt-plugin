@@ -60,6 +60,8 @@ class SubmittedStepContext:
     req_id_to_index: dict[str, int]
     request_states: tuple[CachedRequestState, ...]
     submit_time_ns: int
+    state_slot_ids: tuple[int, ...] = ()
+    state_slot_generations: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -188,11 +190,20 @@ class TTAsyncDecodeController:
             req_id_to_index = dict(runner.input_batch.req_id_to_index)
         else:
             req_id_to_index = {rid: i for i, rid in enumerate(req_ids)}
+        state_slot_ids: tuple[int, ...] = ()
+        state_slot_generations: tuple[int, ...] = ()
+        if getattr(runner, "supports_virtual_state_slots", False):
+            state_slot_ids = tuple(runner._state_slot_ids_for_rows(req_ids))
+            state_slot_generations = tuple(
+                runner._state_slot_generations_for_rows(req_ids)
+            )
         return SubmittedStepContext(
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
             request_states=tuple(runner.requests[req_id] for req_id in req_ids),
             submit_time_ns=time.perf_counter_ns(),
+            state_slot_ids=state_slot_ids,
+            state_slot_generations=state_slot_generations,
         )
 
     def steady_decode_base_enabled(self) -> bool:
@@ -416,6 +427,8 @@ class TTAsyncDecodeController:
             sampled_token_ids=completed.sampled_token_ids,
             req_ids=completed.context.req_ids,
             request_states=completed.context.request_states,
+            state_slot_ids=completed.context.state_slot_ids,
+            state_slot_generations=completed.context.state_slot_generations,
         )
 
     def submit_async_non_dp_decode(
@@ -525,8 +538,18 @@ class TTAsyncDecodeController:
             kwargs["reset_batch"] = model_input.reset_batch
         # Two consumers, gated differently: ``decode_forward`` moves per-slot GDN
         # state with it always, the seed manager reindexes only on device sampling.
+        if (
+            getattr(runner, "supports_virtual_state_slots", False)
+            and model_input.slot_remap is not None
+        ):
+            raise RuntimeError(
+                "virtual-state models consume stable state_slot_ids and must not "
+                "receive a physical slot_remap"
+            )
         if model_input.slot_remap is not None:
             kwargs["slot_remap"] = model_input.slot_remap
+        if getattr(runner, "supports_virtual_state_slots", False):
+            runner._add_virtual_state_slot_kwargs(kwargs, model_input)
 
         enc_dec_kwargs: dict[str, Any] = {}
         if runner.request_specific_rope:

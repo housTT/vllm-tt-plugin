@@ -251,6 +251,20 @@ def test_build_host_generators_preserves_intermediate_request_rng():
     assert not torch.equal(final.get_state(), final_before)
 
 
+@pytest.mark.parametrize("capacity", [3, 8])
+def test_virtual_model_keeps_device_sampling_for_intermediate_prefill(capacity):
+    runner = SimpleNamespace(
+        supports_intermediate_prefill_device_sampling=True,
+        tt_per_lane_max_num_seqs=capacity,
+    )
+    mask = torch.tensor([True, False, True])
+
+    assert TTModelRunner._device_sampling_for_prefill_mask(runner, True, mask)
+
+    runner.supports_intermediate_prefill_device_sampling = False
+    assert not TTModelRunner._device_sampling_for_prefill_mask(runner, True, mask)
+
+
 def test_get_output_tokens_skips_all_intermediate_prefill_rows():
     runner = SimpleNamespace(
         host_sampler=lambda *args, **kwargs: pytest.fail("sampler must not run")
@@ -409,6 +423,125 @@ def test_submit_decode_forwards_slot_remap_to_model(perform_device_sampling):
 
     assert torch.equal(captured["slot_remap"], remap)
     assert ("sampling_params" in captured) is perform_device_sampling
+
+
+def test_virtual_decode_forwards_only_unpadded_slot_metadata():
+    captured: dict = {}
+
+    class FakeModel:
+        def decode_forward(self, **kwargs):
+            captured.update(kwargs)
+            return torch.zeros((2, 1), dtype=torch.int32)
+
+    runner = SimpleNamespace(
+        kv_caches=object(),
+        trace_mode="decode_only",
+        request_specific_rope=False,
+        supports_virtual_state_slots=True,
+        model=FakeModel(),
+        _add_virtual_state_slot_kwargs=TTModelRunner._add_virtual_state_slot_kwargs,
+    )
+    model_input = SimpleNamespace(
+        input_tokens=torch.zeros((4, 1), dtype=torch.int32),
+        block_tables=torch.zeros((4, 1), dtype=torch.int32),
+        input_positions=torch.tensor([10, 20, -1, -1], dtype=torch.int32),
+        block_tables_per_layer=None,
+        unpadded_batch_size=2,
+        tt_sampling_params=_sampling_params(rows=4),
+        perform_device_sampling=False,
+        prompt_tokens=None,
+        output_tokens=None,
+        reset_batch=False,
+        slot_remap=None,
+        request_ids=["B", "A"],
+        state_slot_ids=[1, 3],
+        state_slot_generations=[7, 4],
+        prefill_empty_slots=None,
+    )
+
+    TTAsyncDecodeController(runner).submit_decode(model_input, read_from_device=True)
+
+    assert captured["request_ids"] == ["B", "A"]
+    assert captured["state_slot_ids"] == [1, 3]
+    assert captured["state_slot_generations"] == [7, 4]
+    assert captured["unpadded_batch_size"] == 2
+    assert "slot_remap" not in captured
+
+
+def test_virtual_decode_rejects_physical_slot_remap():
+    runner = SimpleNamespace(
+        kv_caches=object(),
+        trace_mode="decode_only",
+        request_specific_rope=False,
+        supports_virtual_state_slots=True,
+        model=SimpleNamespace(decode_forward=lambda **_kwargs: None),
+        _add_virtual_state_slot_kwargs=TTModelRunner._add_virtual_state_slot_kwargs,
+    )
+    model_input = SimpleNamespace(
+        input_tokens=torch.zeros((1, 1), dtype=torch.int32),
+        block_tables=torch.zeros((1, 1), dtype=torch.int32),
+        input_positions=torch.zeros((1,), dtype=torch.int32),
+        block_tables_per_layer=None,
+        unpadded_batch_size=1,
+        tt_sampling_params=_sampling_params(rows=1),
+        perform_device_sampling=False,
+        prompt_tokens=None,
+        output_tokens=None,
+        reset_batch=False,
+        slot_remap=torch.tensor([0], dtype=torch.int32),
+        request_ids=["A"],
+        state_slot_ids=[0],
+        state_slot_generations=[1],
+        prefill_empty_slots=None,
+    )
+
+    with pytest.raises(RuntimeError, match="must not receive a physical slot_remap"):
+        TTAsyncDecodeController(runner).submit_decode(
+            model_input, read_from_device=True
+        )
+
+
+def test_virtual_prefill_forwards_request_slot_generation_abi():
+    captured: dict = {}
+
+    class FakeModel:
+        def prefill_forward(self, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+    runner = SimpleNamespace(
+        kv_caches=object(),
+        trace_mode="none",
+        request_specific_rope=False,
+        supports_virtual_state_slots=True,
+        model=FakeModel(),
+        _add_virtual_state_slot_kwargs=TTModelRunner._add_virtual_state_slot_kwargs,
+    )
+    model_input = SimpleNamespace(
+        input_tokens=torch.zeros((1, 9), dtype=torch.int32),
+        block_tables=torch.zeros((1, 1), dtype=torch.int32),
+        prompt_lens=[9],
+        input_positions=torch.zeros((1,), dtype=torch.int32),
+        block_tables_per_layer=None,
+        multi_modal_kwargs={},
+        perform_device_sampling=False,
+        prefill_empty_slots=[3],
+        unpadded_batch_size=1,
+        request_ids=["req"],
+        state_slot_ids=[3],
+        state_slot_generations=[11],
+        intermediate_prefill_mask=torch.tensor([True]),
+    )
+
+    TTModelRunner.submit_prefill(runner, model_input, [1])
+
+    assert captured["empty_slots"] == [3]
+    assert captured["request_ids"] == ["req"]
+    assert captured["state_slot_ids"] == [3]
+    assert captured["state_slot_generations"] == [11]
+    assert captured["unpadded_batch_size"] == 1
+    assert captured["start_pos"].tolist() == [0]
+    assert captured["intermediate_prefill_mask"].tolist() == [True]
 
 
 def test_async_lane_decode_uses_batch_extraction():

@@ -15,7 +15,9 @@ against a fake runner.
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import torch
 
 from vllm_tt_plugin.model_runner import TTModelRunner
 
@@ -25,7 +27,10 @@ SLOTS = 8
 def _runner(slots=SLOTS):
     """Fake runner: the state-slot map, the live-request set and the slot capacity."""
     return SimpleNamespace(
-        tt_per_lane_max_num_seqs=slots, _req_state_slot={}, requests={}
+        tt_per_lane_max_num_seqs=slots,
+        _req_state_slot={},
+        requests={},
+        supports_virtual_state_slots=False,
     )
 
 
@@ -284,3 +289,134 @@ def test_a_decoding_request_without_a_slot_raises():
     _prefill(r, ["A"])
     with pytest.raises(RuntimeError, match="'GHOST' has no device state slot"):
         _decode(r, ["A", "GHOST"])
+
+
+def test_virtual_state_slots_remain_stable_across_row_reorder():
+    """A virtual bank is selected explicitly, so row reorder must not relabel it."""
+    r = _runner(slots=4)
+    r.supports_virtual_state_slots = True
+    r._req_state_slot.update({"A": 3, "B": 1})
+    r.requests.update(dict.fromkeys(["A", "B"]))
+
+    assert TTModelRunner._state_slot_ids_for_rows(r, ["B", "A"]) == [1, 3]
+    assert _decode(r, ["B", "A"]) is None
+    assert r._req_state_slot == {"A": 3, "B": 1}
+
+    # An unscheduled request keeps its bank; a new prefill cannot steal it.
+    assert _prefill(r, ["C"]) == [0]
+    assert r._req_state_slot == {"A": 3, "B": 1, "C": 0}
+
+
+def test_virtual_prefill_reserves_reordered_existing_slots_before_newcomers():
+    r = _runner(slots=3)
+    r.supports_virtual_state_slots = True
+    r._req_state_slot["A"] = 0
+    r.requests["A"] = None
+
+    # The newcomer is row 0, but A already owns virtual bank 0 and appears later.
+    assert _prefill(r, ["NEW", "A"]) == [1, 0]
+    assert r._req_state_slot == {"A": 0, "NEW": 1}
+
+
+def test_virtual_slot_generation_changes_only_when_a_lifetime_is_reused():
+    r = _runner(slots=2)
+    r.supports_virtual_state_slots = True
+    assert _prefill(r, ["A"]) == [0]
+    generation_a = TTModelRunner._state_slot_generations_for_rows(r, ["A"])[0]
+
+    # Chunked prefill / reordering retains both the bank and generation.
+    assert _prefill(r, ["A"]) == [0]
+    assert TTModelRunner._state_slot_generations_for_rows(r, ["A"]) == [generation_a]
+
+    _release(r, finished={"A"})
+    r.requests.pop("A")
+    assert _prefill(r, ["B"]) == [0]
+    generation_b = TTModelRunner._state_slot_generations_for_rows(r, ["B"])[0]
+    assert generation_b > generation_a
+
+
+@pytest.mark.parametrize(
+    ("finished", "preempted", "reason"),
+    [({"A"}, None, "finished"), (set(), {"A"}, "preempted")],
+)
+def test_virtual_slot_release_is_generation_tagged(finished, preempted, reason):
+    """Finish/cancel and preemption preserve the exact lifetime for the model hook."""
+    r = _runner(slots=2)
+    r.supports_virtual_state_slots = True
+    assert _prefill(r, ["A"]) == [0]
+    generation = TTModelRunner._state_slot_generations_for_rows(r, ["A"])[0]
+
+    _release(r, finished=finished, preempted=preempted)
+
+    assert r._req_state_slot == {}
+    assert r._req_state_generation == {}
+    assert r._pending_virtual_state_releases == [("A", 0, generation, reason)]
+
+
+def test_idle_finish_drains_async_before_releasing_virtual_bank():
+    """A finish-only scheduler step must not defer cleanup until another request."""
+    calls = []
+    runner = SimpleNamespace(
+        _pending_virtual_state_releases=[("A", 0, 3, "finished")],
+        model=SimpleNamespace(
+            release_virtual_state_slots=lambda releases: calls.append(
+                ("release", list(releases))
+            )
+        ),
+        async_decode=SimpleNamespace(
+            wait_for_all_pending_async_steps=lambda: calls.append(("drain", None))
+        ),
+        _update_states=lambda _scheduler_output: calls.append(("update", None)),
+    )
+    runner._flush_virtual_state_releases = lambda: (
+        TTModelRunner._flush_virtual_state_releases(runner)
+    )
+    scheduler_output = SimpleNamespace(total_num_scheduled_tokens=0)
+
+    assert TTModelRunner.build_model_input(runner, scheduler_output, None) is None
+    assert calls == [
+        ("update", None),
+        ("drain", None),
+        ("release", [("A", 0, 3, "finished")]),
+    ]
+    assert runner._pending_virtual_state_releases == []
+
+
+def test_failed_virtual_release_hook_keeps_release_queued():
+    runner = SimpleNamespace(
+        _pending_virtual_state_releases=[("A", 0, 3, "preempted")],
+        model=SimpleNamespace(),
+    )
+
+    with pytest.raises(RuntimeError, match="release_virtual_state_slots"):
+        TTModelRunner._flush_virtual_state_releases(runner)
+
+    assert runner._pending_virtual_state_releases == [("A", 0, 3, "preempted")]
+
+
+def test_stale_virtual_generation_cannot_apply_a_deferred_token():
+    """Cancel/reuse after submit must not mutate the new slot lifetime."""
+    old_state = SimpleNamespace(output_token_ids=[])
+    runner = SimpleNamespace(
+        requests={"A": old_state},
+        _req_state_slot={"A": 0},
+        _req_state_generation={"A": 2},  # submitted context captured generation 1
+        input_batch=SimpleNamespace(
+            req_id_to_index={"A": 0},
+            token_ids_cpu=np.zeros((1, 8), dtype=np.int32),
+            num_tokens=np.array([1], dtype=np.int32),
+        ),
+        model_config=SimpleNamespace(max_model_len=8),
+    )
+
+    TTModelRunner._apply_sampled_tokens_to_state(
+        runner,
+        sampled_token_ids=torch.tensor([[42]], dtype=torch.int32),
+        req_ids=["A"],
+        request_states=(old_state,),
+        state_slot_ids=(0,),
+        state_slot_generations=(1,),
+    )
+
+    assert old_state.output_token_ids == []
+    assert runner.input_batch.num_tokens.tolist() == [1]

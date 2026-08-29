@@ -166,6 +166,15 @@ class TTModelRunner:
         self.device_sampling_max_top_k = getattr(
             TTPlatform, "device_sampling_max_top_k", None
         )
+        self.force_host_seeded_sampling = getattr(
+            TTPlatform, "force_host_seeded_sampling", False
+        )
+        self.supports_virtual_state_slots = getattr(
+            TTPlatform, "supports_virtual_state_slots", False
+        )
+        self.supports_intermediate_prefill_device_sampling = getattr(
+            TTPlatform, "supports_intermediate_prefill_device_sampling", False
+        )
 
         logger.info(
             "TTModelRunner: trace_mode=%s, "
@@ -221,6 +230,26 @@ class TTModelRunner:
         # RNG, decode trace buffers). Needed because evict/re-add and condense move a
         # request's ROW, not its state.
         self._req_state_slot: dict[str, int] = {}
+        # A generation changes whenever a slot is assigned to a new state
+        # lifetime.  Async completion snapshots use it with request ID and slot so
+        # a canceled/preempted request cannot update a later occupant.
+        self._req_state_generation: dict[str, int] = {}
+        self._state_slot_generations: list[int] = [
+            0 for _ in range(self.tt_per_lane_max_num_seqs)
+        ]
+        # Model-owned virtual banks must outlive ordinary persistent-batch row
+        # moves, but not the request lifetime itself.  Releases are queued by
+        # ``_update_states`` and flushed only after any submitted async decode
+        # has drained, so a finish/cancel/preemption cannot reset a bank while
+        # its final device work is still in flight.
+        self._pending_virtual_state_releases: list[tuple[str, int, int, str]] = []
+
+        if self.supports_virtual_state_slots and self._is_lane_mode:
+            raise ValueError(
+                "virtual state slots do not support single-process lane-DP: "
+                "lane inputs use sparse physical rows and do not carry the "
+                "stable virtual-slot ABI"
+            )
 
         # Every standard-DP rank owns its own mesh and therefore its own host
         # sampler state. Single-process modes also instantiate exactly one.
@@ -826,17 +855,73 @@ class TTModelRunner:
         - PREEMPTED: ``Scheduler._preempt_request`` freed the KV blocks and reset
           ``num_computed_tokens``, so a resume re-prefills the prompt plus every
           generated token and writes the slot's final state itself. Nothing reads the
-          old contents, and holding the slot only inflates ``held`` in
-          ``_alloc_prefill_state_slots``, where a shortfall is fatal. The
-          per-slot seed RNG does not need the hold either: the device seed is derived
-          from the absolute decode position, not from slot residency.
+          old device contents, and holding the slot only inflates ``held`` in
+          ``_alloc_prefill_state_slots``, where a shortfall is fatal. The model
+          lifecycle hook receives the preemption reason and preserves the request's
+          sampler RNG independently of the released device slot.
 
         ``preempted_req_ids`` is typed optional, hence the ``or ()``.
         """
+
+        def release(req_id: str, reason: str) -> None:
+            slot = self._req_state_slot.pop(req_id, None)
+            generation = getattr(self, "_req_state_generation", {}).pop(req_id, None)
+            if (
+                getattr(self, "supports_virtual_state_slots", False)
+                and slot is not None
+                and generation is not None
+            ):
+                pending = getattr(self, "_pending_virtual_state_releases", None)
+                if pending is None:
+                    pending = []
+                    self._pending_virtual_state_releases = pending
+                pending.append((req_id, slot, generation, reason))
+
         for req_id in scheduler_output.finished_req_ids:
-            self._req_state_slot.pop(req_id, None)
+            release(req_id, "finished")
         for req_id in scheduler_output.preempted_req_ids or ():
-            self._req_state_slot.pop(req_id, None)
+            release(req_id, "preempted")
+
+    def _flush_virtual_state_releases(self) -> None:
+        """Release dead model-owned banks after submitted async work drains."""
+        pending = getattr(self, "_pending_virtual_state_releases", None)
+        if not pending:
+            return
+        hook = getattr(self.model, "release_virtual_state_slots", None)
+        if not callable(hook):
+            raise RuntimeError(
+                "a virtual-state model must implement "
+                "release_virtual_state_slots(released_slots)"
+            )
+        releases = list(pending)
+        hook(releases)
+        del pending[: len(releases)]
+
+    def _ensure_state_slot_generation_storage(self) -> None:
+        """Initialize generation bookkeeping on old/fake runners lazily."""
+        n_slots = self.tt_per_lane_max_num_seqs
+        generations = getattr(self, "_state_slot_generations", None)
+        if generations is None:
+            self._state_slot_generations = [0 for _ in range(n_slots)]
+        elif len(generations) != n_slots:
+            raise RuntimeError(
+                "device state-slot generation capacity changed after allocation: "
+                f"{len(generations)} != {n_slots}"
+            )
+        if not hasattr(self, "_req_state_generation"):
+            self._req_state_generation = {}
+
+    def _claim_state_slot(self, req_id: str, slot: int) -> None:
+        """Record one state lifetime, retaining its generation when unchanged."""
+        TTModelRunner._ensure_state_slot_generation_storage(self)
+        if (
+            self._req_state_slot.get(req_id) == slot
+            and req_id in self._req_state_generation
+        ):
+            return
+        self._state_slot_generations[slot] += 1
+        self._req_state_slot[req_id] = slot
+        self._req_state_generation[req_id] = self._state_slot_generations[slot]
 
     def _alloc_prefill_state_slots(self, row_req_ids: list[str]) -> list[int]:
         """Pick each prefilling request's state slot, skipping slots that live
@@ -854,15 +939,33 @@ class TTModelRunner:
                 f"{len(row_req_ids)} prefill(s) exceed the {n_slots} device state "
                 "slots; admission is the scheduler's job, not this function's"
             )
+        virtual_slots = getattr(self, "supports_virtual_state_slots", False)
         prefilling = set(row_req_ids)
-        held = {
-            slot
-            for req_id, slot in self._req_state_slot.items()
-            if req_id not in prefilling and req_id in self.requests
-        }
+        if virtual_slots:
+            # Reserve existing virtual banks before assigning any newcomer.  An
+            # incoming row can otherwise take slot 0 before a reordered live
+            # request later in ``row_req_ids`` has had a chance to retain it.
+            held = {
+                slot
+                for req_id, slot in self._req_state_slot.items()
+                if req_id in self.requests
+            }
+        else:
+            held = {
+                slot
+                for req_id, slot in self._req_state_slot.items()
+                if req_id not in prefilling and req_id in self.requests
+            }
         slots: list[int] = []
+        assigned: set[int] = set()
         for row, req_id in enumerate(row_req_ids):
-            if row not in held:
+            # A virtual bank is stable for a request's lifetime.  Chunked prefill
+            # and ordinary unscheduling therefore retain an existing claim even
+            # when vLLM has moved the request to another persistent-batch row.
+            existing = self._req_state_slot.get(req_id)
+            if virtual_slots and existing is not None:
+                slot = existing
+            elif row not in held:
                 slot = row
             else:
                 free = [s for s in range(n_slots) if s not in held]
@@ -876,10 +979,60 @@ class TTModelRunner:
                         f"map={self._req_state_slot}"
                     )
                 slot = free[0]
+            if slot in assigned:
+                raise RuntimeError(
+                    f"device state slot {slot} is claimed more than once while "
+                    f"prefilling {row_req_ids}: map={self._req_state_slot}"
+                )
             held.add(slot)
-            self._req_state_slot[req_id] = slot
+            assigned.add(slot)
+            TTModelRunner._claim_state_slot(self, req_id, slot)
             slots.append(slot)
         return slots
+
+    def _state_slot_ids_for_rows(self, row_req_ids: list[str]) -> list[int]:
+        """Return validated stable state slots for real (unpadded) rows."""
+        n_slots = self.tt_per_lane_max_num_seqs
+        if len(row_req_ids) > n_slots:
+            raise RuntimeError(
+                f"{len(row_req_ids)} decode row(s) exceed the {n_slots} device state "
+                "slots"
+            )
+        slots: list[int] = []
+        for req_id in row_req_ids:
+            slot = self._req_state_slot.get(req_id)
+            if slot is None:
+                raise RuntimeError(
+                    f"decoding request {req_id!r} has no device state slot: "
+                    f"map={self._req_state_slot}"
+                )
+            slots.append(slot)
+        if len(set(slots)) != len(slots) or any(
+            not 0 <= slot < n_slots for slot in slots
+        ):
+            duplicates = sorted({slot for slot in slots if slots.count(slot) > 1})
+            raise RuntimeError(
+                f"TT decode state slots are not a permutation: want={slots}, "
+                f"duplicated={duplicates}, capacity={n_slots}, "
+                f"map={self._req_state_slot}"
+            )
+        return slots
+
+    def _state_slot_generations_for_rows(self, row_req_ids: list[str]) -> list[int]:
+        """Return generations aligned with ``_state_slot_ids_for_rows``."""
+        TTModelRunner._ensure_state_slot_generation_storage(self)
+        generations: list[int] = []
+        for req_id in row_req_ids:
+            generation = self._req_state_generation.get(req_id)
+            if generation is None:
+                # Backward-compatible recovery for a runner/map created before
+                # generation tracking (also useful for host-only fake runners).
+                slot = self._req_state_slot[req_id]
+                self._state_slot_generations[slot] += 1
+                generation = self._state_slot_generations[slot]
+                self._req_state_generation[req_id] = generation
+            generations.append(generation)
+        return generations
 
     def _decode_state_slot_remap(self, row_req_ids: list[str]) -> torch.Tensor | None:
         """Gather permutation taking each request's state to its decode row: row
@@ -887,33 +1040,12 @@ class TTModelRunner:
         means identity, so skip it. Commits the move to ``self._req_state_slot`` for
         every request the permutation touches, off-batch holders included."""
         n_slots = self.tt_per_lane_max_num_seqs
-        # More decode rows than slots means the batch cannot be described at all, so
-        # truncating would just drop a request's state silently.
-        if len(row_req_ids) > n_slots:
-            raise RuntimeError(
-                f"{len(row_req_ids)} decode row(s) exceed the {n_slots} device state "
-                "slots"
-            )
-        want: list[int] = []
-        for req_id in row_req_ids:
-            slot = self._req_state_slot.get(req_id)
-            # Every decoding request got a slot at prefill. Inventing one here is how
-            # a second request ends up recorded at an owned slot.
-            if slot is None:
-                raise RuntimeError(
-                    f"decoding request {req_id!r} has no device state slot: "
-                    f"map={self._req_state_slot}"
-                )
-            want.append(slot)
-        if len(set(want)) != len(want) or any(not 0 <= s < n_slots for s in want):
-            # Refusing the remap is not the safe option: no gather goes out for the
-            # WHOLE batch, so every off-row request reads another's state.
-            duplicates = sorted({s for s in want if want.count(s) > 1})
-            raise RuntimeError(
-                f"TT decode state slots are not a permutation: want={want}, "
-                f"duplicated={duplicates}, capacity={n_slots}, "
-                f"map={self._req_state_slot}"
-            )
+        want = TTModelRunner._state_slot_ids_for_rows(self, row_req_ids)
+        if getattr(self, "supports_virtual_state_slots", False):
+            # The model restores each row's stable bank explicitly.  Relabeling
+            # ownership here would make the following step restore another user's
+            # state even though no physical gather occurred.
+            return None
         taken = set(want)
         remap = want + [s for s in range(n_slots) if s not in taken]
         # The gather moves every slot, not just the batch rows: ownership must follow.
@@ -966,6 +1098,19 @@ class TTModelRunner:
         # ok because this happens consistently.
         input_batch.advance_generators(rows_to_advance)
         return generators
+
+    def _device_sampling_for_prefill_mask(
+        self,
+        selected: bool,
+        intermediate_prefill_mask: torch.Tensor | None,
+    ) -> bool:
+        """Keep token-out prefill for models that suppress intermediate rows."""
+
+        if not selected or intermediate_prefill_mask is None:
+            return selected
+        if not bool(intermediate_prefill_mask.any()):
+            return selected
+        return bool(self.supports_intermediate_prefill_device_sampling)
 
     def _prepare_model_inputs(
         self,
@@ -1212,7 +1357,9 @@ class TTModelRunner:
             is_decode=not is_prompt,
             has_structured_outputs=has_structured,
         )
-        if intermediate_prefill_mask is not None and intermediate_prefill_mask.any():
+        if not TTModelRunner._device_sampling_for_prefill_mask(
+            self, perform_device_sampling, intermediate_prefill_mask
+        ):
             # Device sampling advances device RNG state for every row it reads,
             # which an intermediate chunk must not do. Host sampling can hand
             # those rows a generator clone instead.
@@ -1305,12 +1452,17 @@ class TTModelRunner:
         prefill_empty_slots = None
         slot_remap = None
         if is_prompt:
-            prefill_empty_slots = self._alloc_prefill_state_slots(row_req_ids)
+            state_slot_ids = self._alloc_prefill_state_slots(row_req_ids)
+            prefill_empty_slots = state_slot_ids
         else:
-            # Advances the ownership map to the post-gather layout, so the returned
-            # remap has to reach the device: dropping it would leave the map claiming
-            # a move that never happened.
-            slot_remap = self._decode_state_slot_remap(row_req_ids)
+            state_slot_ids = self._state_slot_ids_for_rows(row_req_ids)
+            if not self.supports_virtual_state_slots:
+                # Advances the ownership map to the post-gather layout, so the
+                # returned remap has to reach the device.
+                slot_remap = self._decode_state_slot_remap(row_req_ids)
+                # Physical gather moves request state into row order.
+                state_slot_ids = list(range(num_reqs))
+        state_slot_generations = self._state_slot_generations_for_rows(row_req_ids)
 
         return TTModelInput(
             input_tokens=input_tokens,
@@ -1338,6 +1490,9 @@ class TTModelRunner:
             # back to ``range(N)`` and a prefill overwrites a decoding request's
             # state. Stateless models ignore it.
             prefill_empty_slots=prefill_empty_slots,
+            request_ids=row_req_ids,
+            state_slot_ids=state_slot_ids,
+            state_slot_generations=state_slot_generations,
             intermediate_prefill_mask=intermediate_prefill_mask,
         )
 
@@ -1356,6 +1511,12 @@ class TTModelRunner:
         """
         # Update cached state
         self._update_states(scheduler_output)
+        if getattr(self, "_pending_virtual_state_releases", None):
+            # This also covers a finish/cancel-only idle step.  Draining before
+            # the lifecycle callback prevents a late decode from writing a bank
+            # after the model has reset or reassigned it.
+            self.async_decode.wait_for_all_pending_async_steps()
+            self._flush_virtual_state_releases()
         if not scheduler_output.total_num_scheduled_tokens:
             return None
 
@@ -1793,6 +1954,20 @@ class TTModelRunner:
         if not self.supports_device_sampling_penalties and not input_batch.no_penalties:
             return False
 
+        # The output ABI is cohort-global: one host-only companion otherwise
+        # moves a device-eligible row from the TT sampler to vLLM's host sampler.
+        # Those samplers use different RNG algorithms, so an explicit seed alone
+        # cannot make their sampled text equal.  Model opt-in keeps stochastic
+        # seeded requests on the host for their complete lifetime regardless of
+        # cohort composition/order.  Unseeded and greedy performance requests
+        # retain the canonical on-device token-out path.
+        if self.force_host_seeded_sampling:
+            active = slice(0, input_batch.num_reqs)
+            temperature = input_batch.sampling.temperature[active]
+            seed = input_batch.sampling.seed[active]
+            if bool(torch.any((temperature != 0) & (seed != SEED_NONE_SENTINEL))):
+                return False
+
         # A model may expose only a bounded canonical top-k device sampler.
         # Greedy requests remain valid regardless of vLLM's top_k=0 sentinel;
         # random requests outside the declared bound use the explicit host
@@ -1802,9 +1977,7 @@ class TTModelRunner:
             temperature = input_batch.sampling.temperature[active]
             top_k = input_batch.sampling.top_k[active]
             random = temperature != 0
-            unsupported_top_k = (top_k < 1) | (
-                top_k > self.device_sampling_max_top_k
-            )
+            unsupported_top_k = (top_k < 1) | (top_k > self.device_sampling_max_top_k)
             if bool(torch.any(random & unsupported_top_k)):
                 return False
 
@@ -1848,6 +2021,9 @@ class TTModelRunner:
             "enable_trace": self.trace_mode in ["all"],
             "prompt_lens": model_input.prompt_lens,
             "start_pos": model_input.input_positions,
+            "intermediate_prefill_mask": getattr(
+                model_input, "intermediate_prefill_mask", None
+            ),
         }
         # Hybrid attention models route per-layer block tables; the
         # runner already expanded ``block_tables_per_group`` into a
@@ -1885,6 +2061,8 @@ class TTModelRunner:
                     empty_slots.append(dp_rank * stride + i)
         if empty_slots is not None:
             kwargs["empty_slots"] = list(empty_slots)
+        if getattr(self, "supports_virtual_state_slots", False):
+            self._add_virtual_state_slot_kwargs(kwargs, model_input)
 
         if self.request_specific_rope:
             tt_out, rope_deltas = self.model.prefill_forward(**kwargs)
@@ -1893,6 +2071,42 @@ class TTModelRunner:
                 self.requests[req_id].mrope_position_delta = rope_deltas[i].item()
             return tt_out
         return self.model.prefill_forward(**kwargs)
+
+    @staticmethod
+    def _add_virtual_state_slot_kwargs(
+        kwargs: dict[str, Any], model_input: TTModelInput
+    ) -> None:
+        """Forward real-row virtual-slot metadata, excluding padded tail rows."""
+        request_ids = model_input.request_ids
+        state_slot_ids = model_input.state_slot_ids
+        generations = model_input.state_slot_generations
+        if request_ids is None or state_slot_ids is None or generations is None:
+            raise RuntimeError(
+                "virtual-state model input is missing request_ids, state_slot_ids, "
+                "or state_slot_generations"
+            )
+        if isinstance(model_input.unpadded_batch_size, list):
+            active_rows = sum(int(size) for size in model_input.unpadded_batch_size)
+        else:
+            active_rows = int(model_input.unpadded_batch_size)
+        if not (
+            len(request_ids) == len(state_slot_ids) == len(generations) == active_rows
+        ):
+            raise RuntimeError(
+                "virtual-state metadata must contain exactly the unpadded rows: "
+                f"requests={len(request_ids)}, slots={len(state_slot_ids)}, "
+                f"generations={len(generations)}, active={active_rows}"
+            )
+        empty_slots = model_input.prefill_empty_slots
+        if empty_slots is not None and list(empty_slots) != list(state_slot_ids):
+            raise RuntimeError(
+                "virtual prefill destinations disagree with stable state slots: "
+                f"empty_slots={empty_slots}, state_slot_ids={state_slot_ids}"
+            )
+        kwargs["request_ids"] = list(request_ids)
+        kwargs["state_slot_ids"] = list(state_slot_ids)
+        kwargs["state_slot_generations"] = list(generations)
+        kwargs["unpadded_batch_size"] = model_input.unpadded_batch_size
 
     def _forward_with_model_input(
         self,
@@ -2256,6 +2470,8 @@ class TTModelRunner:
         sampled_token_ids: torch.Tensor,
         req_ids: list[str] | None = None,
         request_states: tuple[CachedRequestState, ...] | None = None,
+        state_slot_ids: tuple[int, ...] = (),
+        state_slot_generations: tuple[int, ...] = (),
     ) -> None:
         # When applying a deferred async step, the write row is resolved live
         # from ``req_id_to_index`` (below), not from the row captured at submit
@@ -2298,12 +2514,31 @@ class TTModelRunner:
 
         assert req_ids is not None
         captured_req_ids = req_ids
+        if state_slot_ids and not (
+            len(state_slot_ids) == len(state_slot_generations) == len(captured_req_ids)
+        ):
+            raise RuntimeError(
+                "async virtual-slot context vectors must match request rows: "
+                f"requests={len(captured_req_ids)}, slots={len(state_slot_ids)}, "
+                f"generations={len(state_slot_generations)}"
+            )
         for req_idx, req_id in enumerate(captured_req_ids):
             req_state = self.requests.get(req_id)
             if req_state is None:
                 continue
             if request_states is not None and req_state is not request_states[req_idx]:
                 continue
+            if state_slot_ids:
+                current_slot = self._req_state_slot.get(req_id)
+                current_generation = self._req_state_generation.get(req_id)
+                if (
+                    current_slot != state_slot_ids[req_idx]
+                    or current_generation != state_slot_generations[req_idx]
+                ):
+                    # A finish/cancel/preemption released this lifetime and the slot
+                    # may already belong to another request.  Its late result is
+                    # intentionally discarded.
+                    continue
 
             current_row = self.input_batch.req_id_to_index.get(req_id)
             if current_row is not None:
