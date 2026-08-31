@@ -69,6 +69,36 @@ def test_diffusion_gemma_uses_tt_architecture_before_upstream_config_hooks(
     assert vllm_config.diffusion_config is None
 
 
+@pytest.mark.parametrize(
+    ("num_hidden_layers", "num_local_experts", "expected_architecture"),
+    [
+        (36, 128, "TTGptOss120BForCausalLM"),
+        (24, 32, "GptOssForCausalLM"),
+    ],
+)
+def test_gpt_oss_120b_gets_a_dedicated_tt_architecture(
+    monkeypatch: pytest.MonkeyPatch,
+    num_hidden_layers: int,
+    num_local_experts: int,
+    expected_architecture: str,
+):
+    from vllm.config import model as model_config_module
+
+    hf_config = SimpleNamespace(
+        architectures=["GptOssForCausalLM"],
+        model_type="gpt_oss",
+        num_hidden_layers=num_hidden_layers,
+        num_local_experts=num_local_experts,
+    )
+    monkeypatch.setattr(
+        model_config_module, "get_config", lambda *args, **kwargs: hf_config
+    )
+
+    tt_platform._install_diffusion_gemma_architecture_patch()
+
+    assert model_config_module.get_config().architectures == [expected_architecture]
+
+
 def _capture_registry_calls(monkeypatch, module, *, test_models_cli=False):
     events = []
     monkeypatch.setattr(

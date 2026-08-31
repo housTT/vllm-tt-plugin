@@ -8,6 +8,10 @@ import regex as re
 
 CHOICES = ["red", "green", "blue", "yellow"]
 REGEX = r"LANE-[0-9]"
+# GPT-OSS can spend about 90 low-effort tokens in the Harmony analysis channel
+# before opening the grammar-constrained final channel. Keep this test's budget
+# above that observed boundary so it validates structured output, not truncation.
+CHAT_MAX_COMPLETION_TOKENS = 128
 JSON_SCHEMA = {
     "type": "object",
     "properties": {
@@ -28,8 +32,9 @@ async def _send_choice_request(async_client, model: str, request_id: int) -> str
                 "content": f"Pick one color for request {request_id}.",
             }
         ],
-        max_completion_tokens=8,
+        max_completion_tokens=CHAT_MAX_COMPLETION_TOKENS,
         temperature=0,
+        reasoning_effort="low",
         extra_body={"structured_outputs": {"choice": CHOICES}},
     )
     content = response.choices[0].message.content
@@ -48,8 +53,9 @@ async def _send_regex_request(async_client, model: str, request_id: int) -> str:
                 ),
             }
         ],
-        max_completion_tokens=16,
+        max_completion_tokens=CHAT_MAX_COMPLETION_TOKENS,
         temperature=0,
+        reasoning_effort="low",
         extra_body={"structured_outputs": {"regex": REGEX}},
     )
     content = response.choices[0].message.content
@@ -70,8 +76,9 @@ async def _send_json_request(async_client, model: str, request_id: int) -> dict:
                 ),
             }
         ],
-        max_completion_tokens=64,
+        max_completion_tokens=CHAT_MAX_COMPLETION_TOKENS,
         temperature=0,
+        reasoning_effort="low",
         extra_body={"structured_outputs": {"json": JSON_SCHEMA}},
     )
     content = response.choices[0].message.content
@@ -93,8 +100,9 @@ async def _send_plain_request(async_client, model: str, request_id: int) -> str:
                 "content": f"Reply with a short sentence for request {request_id}.",
             }
         ],
-        max_completion_tokens=16,
+        max_completion_tokens=CHAT_MAX_COMPLETION_TOKENS,
         temperature=0,
+        reasoning_effort="low",
     )
     content = response.choices[0].message.content
     assert content

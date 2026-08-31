@@ -421,7 +421,8 @@ implementations. Current families:
 - DiffusionGemma block-output models (`TTDiffusionGemmaForBlockDiffusion`,
   `TTDiffusionGemmaForCausalLM`)
 - DeepSeek V3 (`TTDeepseekV3ForCausalLM`)
-- GPT-OSS 20B / 120B (`TTGptOssForCausalLM`)
+- GPT-OSS 20B (`TTGptOssForCausalLM`) and GPT-OSS 120B
+  (`TTGptOss120BForCausalLM`)
 
 Model availability, supported device shapes, max sequence limits, and required
 environment variables are documented in the corresponding tt-metal model demos.

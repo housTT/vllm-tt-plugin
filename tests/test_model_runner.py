@@ -22,6 +22,7 @@ DP_SIZE = 1
 SAMPLED_TOKEN_ID = 42
 # endregion Constants
 
+
 # region Test helpers
 
 
@@ -111,6 +112,7 @@ def test_cached_chunked_prefill_classification(
         num_computed_tokens=num_computed_tokens,
     )
     runner = _fake_runner(batch, request)
+    runner._decode_layout_change_removal_only = True
     num_scheduled_tokens = 2
 
     scheduler_output = SchedulerOutput.make_empty()
@@ -133,6 +135,7 @@ def test_cached_chunked_prefill_classification(
         num_computed_tokens + num_scheduled_tokens
     ]
     assert model_input.intermediate_prefill_mask.tolist() == [intermediate_prefill_mask]
+    assert runner._decode_layout_change_removal_only is False
 
 
 def test_resumed_replay_past_prompt_length_remains_prefill():
@@ -192,6 +195,8 @@ def test_completed_cached_request_builds_decode_input(output_len: int):
         num_computed_tokens=num_computed_tokens,
     )
     runner = _fake_runner(batch, request)
+    runner._decode_layout_changed_since_last_decode = True
+    runner._decode_layout_change_removal_only = True
     num_scheduled_tokens = 1
 
     scheduler_output = SchedulerOutput.make_empty()
@@ -210,6 +215,8 @@ def test_completed_cached_request_builds_decode_input(output_len: int):
     model_input = TTModelRunner._prepare_model_inputs(runner, scheduler_output, None)
 
     assert model_input is not None
+    assert model_input.reset_batch is True
+    assert model_input.removal_only_reset is True
     assert model_input.prompt_lens is None
     assert model_input.input_positions.tolist() == [num_tokens - 1] + [-1] * (
         MAX_NUM_SEQS - 1

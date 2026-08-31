@@ -528,7 +528,7 @@ def _register_model_if_missing(ModelRegistry, model_arch: str, model_path: str) 
 
 
 def _install_diffusion_gemma_architecture_patch() -> None:
-    """Resolve DiffusionGemma through its TT architecture before config hooks.
+    """Resolve checkpoint-specific TT architectures before config hooks.
 
     ``ModelConfig`` resolves its architecture and immediately dispatches through
     vLLM's ``MODELS_CONFIG_MAP``. The upstream bare architecture has a diffusion
@@ -536,6 +536,12 @@ def _install_diffusion_gemma_architecture_patch() -> None:
     generation defaults before ``TTPlatform.check_and_update_config`` can run.
     Rewrite the two checkpoint architecture names as the HF config is loaded so
     registry inspection selects the TT alias and that upstream hook never runs.
+
+    GPT-OSS 20B and 120B publish the same HF architecture name, while the 120B
+    autoport has a distinct TT implementation. Detect the 120B checkpoint from
+    its stable topology and rewrite only that config to its dedicated alias.
+    The ordinary ``TTGptOssForCausalLM`` route therefore remains available for
+    GPT-OSS 20B.
     """
     from vllm.config import model as model_config_module
 
@@ -551,6 +557,15 @@ def _install_diffusion_gemma_architecture_patch() -> None:
                 _DIFFUSION_GEMMA_TT_ARCHITECTURES.get(arch, arch)
                 for arch in architectures
             ]
+            if (
+                getattr(hf_config, "model_type", None) == "gpt_oss"
+                and getattr(hf_config, "num_hidden_layers", None) == 36
+                and getattr(hf_config, "num_local_experts", None) == 128
+            ):
+                hf_config.architectures = [
+                    "TTGptOss120BForCausalLM" if arch == "GptOssForCausalLM" else arch
+                    for arch in hf_config.architectures
+                ]
         return hf_config
 
     get_config_with_tt_diffusion_gemma._tt_diffusion_gemma_architecture_patch = True
@@ -1176,6 +1191,11 @@ def register_tt_models(register_test_models=False) -> None:
         "TTGptOssForCausalLM",
         "models.tt_transformers.tt.generator_vllm:GptOssForCausalLM",
     )
+    _register_model_if_missing(
+        ModelRegistry,
+        "TTGptOss120BForCausalLM",
+        "models.autoports.openai_gpt_oss_120b.tt.generator_vllm:TTGptOssForCausalLM",
+    )
 
     # Optionally register test models if explicitly enabled
     if register_test_models:
@@ -1445,9 +1465,9 @@ class TTPlatform(Platform):
     def _apply_check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         _apply_chunked_prefill_policy(vllm_config)
 
-        assert not vllm_config.speculative_config, (
-            "Speculative decoding is not yet supported for TT backend"
-        )
+        assert (
+            not vllm_config.speculative_config
+        ), "Speculative decoding is not yet supported for TT backend"
         assert (
             vllm_config.parallel_config.tensor_parallel_size == 1
             and vllm_config.parallel_config.pipeline_parallel_size == 1
@@ -1489,9 +1509,10 @@ class TTPlatform(Platform):
         register_test_models = False
         if tt_config and "register_test_models" in tt_config:
             register_test_models = tt_config["register_test_models"]
-            assert register_test_models in [True, False], (
-                f"Invalid option register_test_models: {register_test_models}"
-            )
+            assert register_test_models in [
+                True,
+                False,
+            ], f"Invalid option register_test_models: {register_test_models}"
         register_tt_models(register_test_models)
 
         parallel_config = vllm_config.parallel_config
@@ -1549,9 +1570,10 @@ class TTPlatform(Platform):
         always_compat_sampling = False
         if tt_config is not None and "always_compat_sampling" in tt_config:
             always_compat_sampling = tt_config["always_compat_sampling"]
-            assert always_compat_sampling in [True, False], (
-                "always_compat_sampling must be a boolean"
-            )
+            assert always_compat_sampling in [
+                True,
+                False,
+            ], "always_compat_sampling must be a boolean"
             if always_compat_sampling:
                 raise ValueError(
                     "always_compat_sampling is not yet supported for V1 TT backend."
@@ -1652,9 +1674,9 @@ class TTPlatform(Platform):
                     f"{declared_canvas_length} != {output_tokens_per_step}"
                 )
             model_config.__dict__.pop("is_diffusion", None)
-            assert not model_config.is_diffusion, (
-                "Block-output setup failed to clear upstream diffusion detection"
-            )
+            assert (
+                not model_config.is_diffusion
+            ), "Block-output setup failed to clear upstream diffusion detection"
 
             # The general-plugins architecture rewrite keeps upstream's
             # MODELS_CONFIG_MAP hook from ever auto-creating this config, so a

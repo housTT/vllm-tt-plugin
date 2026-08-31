@@ -117,6 +117,11 @@ class TTModelInput:
     # previous step (used by on-device sampling).
     reset_batch: bool = False
 
+    # Decode-only: the pending layout change contains removals/condensation but
+    # no admission or prefill. Models with fixed-width decode traces can retain
+    # their active trace bucket while surviving requests finish.
+    removal_only_reset: bool = False
+
     # Decode-only: device state slot remap - row i reads slot remap[i]. From
     # ``_req_state_slot`` (lane mode: the condense-move remap). ``None`` means
     # identity. Shape: [total_B].

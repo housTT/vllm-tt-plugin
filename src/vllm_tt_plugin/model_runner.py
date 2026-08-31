@@ -216,6 +216,7 @@ class TTModelRunner:
         # change during prefill steps (e.g. new requests added), so we keep a
         # sticky flag and clear it only after a decode input consumes it.
         self._decode_layout_changed_since_last_decode: bool = True
+        self._decode_layout_change_removal_only: bool = False
 
         # Forward/sampling split: ``execute_model`` runs the device forward,
         # enqueues a deferred sampler here, and returns ``None``; the engine
@@ -766,6 +767,14 @@ class TTModelRunner:
         # Mark decode layout changed if persistent batch changed. This is
         # sticky across steps and will be consumed by the next decode batch.
         if persistent_batch_layout_changed:
+            removal_only = not req_ids_to_add
+            if self._decode_layout_changed_since_last_decode:
+                self._decode_layout_change_removal_only = (
+                    getattr(self, "_decode_layout_change_removal_only", False)
+                    and removal_only
+                )
+            else:
+                self._decode_layout_change_removal_only = removal_only
             self._decode_layout_changed_since_last_decode = True
 
         # Refresh logits processors with batch state changes
@@ -1193,6 +1202,10 @@ class TTModelRunner:
                 req_indices, :max_prefill_tokens
             ]
             reset_batch = False
+            # Prefill globally rebuilds device penalty history. Even if the
+            # pending layout change began as removal-only, the next decode must
+            # rebuild from scheduler-owned histories instead of preserving it.
+            self._decode_layout_change_removal_only = False
         else:
             positions_np = input_batch.num_tokens[req_indices] - 1
             input_positions = torch.from_numpy(positions_np)
@@ -1203,7 +1216,11 @@ class TTModelRunner:
             # For on-device decode sampling, tell the backend if the padded
             # decode batch layout changed since the previous step.
             reset_batch = self._decode_layout_changed_since_last_decode
+            removal_only_reset = reset_batch and getattr(
+                self, "_decode_layout_change_removal_only", False
+            )
             self._decode_layout_changed_since_last_decode = False
+            self._decode_layout_change_removal_only = False
 
             # TODO: Remove once TT models can support arbitrary batch sizes.
             # Pad decode to the lane/rank wire capacity.
@@ -1382,7 +1399,6 @@ class TTModelRunner:
             # remap has to reach the device: dropping it would leave the map claiming
             # a move that never happened.
             slot_remap = self._decode_state_slot_remap(row_req_ids)
-
         return TTModelInput(
             input_tokens=input_tokens,
             input_positions=input_positions,
@@ -1399,6 +1415,7 @@ class TTModelRunner:
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
             reset_batch=reset_batch,
+            removal_only_reset=(removal_only_reset if not is_prompt else False),
             slot_remap=slot_remap,
             # Host-only sampling params - wrapped in lists for DP compatibility
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
@@ -2182,9 +2199,9 @@ class TTModelRunner:
                 # (per-rank lists).
                 # These are populated for both DP and non-DP cases.
                 rank_max_num_logprobs = model_input.max_num_logprobs[dp_rank]
-                allowed_token_ids_mask = model_input.allowed_token_ids_mask_list[  # noqa: E501
+                allowed_token_ids_mask = model_input.allowed_token_ids_mask_list[
                     dp_rank
-                ]
+                ]  # noqa: E501
                 if allowed_token_ids_mask is not None:
                     # Slice to actual batch size for this rank
                     allowed_token_ids_mask = allowed_token_ids_mask[:sz]
@@ -2223,9 +2240,9 @@ class TTModelRunner:
                 # Capture logprobs for this DP rank
                 logprobs_per_dp.append(sampler_output.logprobs_tensors)
             else:  # sample on device
-                assert model_input.grammar_bitmask[dp_rank] is None, (
-                    "grammar bitmask is set but device sampling can't apply it"
-                )
+                assert (
+                    model_input.grammar_bitmask[dp_rank] is None
+                ), "grammar bitmask is set but device sampling can't apply it"
 
                 next_token_ids = _take(tt_out).reshape(sz, -1)
                 if next_token_ids.shape[1] != self._output_tokens_per_step:

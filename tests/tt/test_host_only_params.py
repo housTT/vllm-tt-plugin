@@ -27,9 +27,9 @@ class TestHostOnlyParameters:
         results = run_concurrent_batch(tt_server, tt_model_name, configs)
         assert len(results) == len(configs)
         # min_p affects sampling distribution - just verify we get output
-        assert results[0] is not None and len(results[0]) > 0, (
-            "should produce non-empty output"
-        )
+        assert (
+            results[0] is not None and len(results[0]) > 0
+        ), "should produce non-empty output"
 
     def test_bad_words(self, tt_server, tt_model_name, max_batch_size):
         """Test bad_words parameter prevents specified words from appearing."""
@@ -46,11 +46,27 @@ class TestHostOnlyParameters:
             for i in range(5)
         ]
         # bad_words is only available in chat completions API
-        results = run_concurrent_batch(tt_server, tt_model_name, configs, use_chat=True)
-        assert len(results) == len(configs)
+        responses = run_concurrent_batch(
+            tt_server,
+            tt_model_name,
+            configs,
+            use_chat=True,
+            return_full_response=True,
+        )
+        assert len(responses) == len(configs)
 
-        for i, text in enumerate(results):
-            assert text is not None, f"Response {i} content is None"
+        for i, response in enumerate(responses):
+            message = response.choices[0].message
+            # Reasoning models can exhaust max_tokens before opening the final
+            # channel. Both reasoning and final content are generated text, so
+            # bad-word coverage must inspect both instead of treating a valid
+            # reasoning-only response as missing output.
+            text = "\n".join(
+                part
+                for part in (getattr(message, "reasoning", None), message.content)
+                if part
+            )
+            assert text, f"Response {i} has no generated reasoning or content"
             # Strip punctuation except '>' to avoid false positives from
             # BPE-merged tokens like ">Hello" (a single token distinct from "Hello")
             punct = string.punctuation.replace(">", "")
