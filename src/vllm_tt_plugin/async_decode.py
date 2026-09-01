@@ -29,9 +29,25 @@ class TTDecodeSubmission:
 
     tt_out: Any | None
     read_events: list[Any] | None
-    batch_size_per_dp: list[int]
+    batch_size_per_dp: tuple[int, ...]
     sampling_params: Any
     perform_device_sampling: bool
+    output_batch_size_per_model: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        # Detach deferred completion from the mutable input-batch list. A later
+        # B1/B32 preparation must not change the width used for this readback.
+        object.__setattr__(self, "batch_size_per_dp", tuple(self.batch_size_per_dp))
+        output_batch_sizes = self.output_batch_size_per_model
+        if output_batch_sizes is None:
+            output_batch_sizes = self.batch_size_per_dp
+        output_batch_sizes = tuple(output_batch_sizes)
+        if len(output_batch_sizes) != len(self.batch_size_per_dp):
+            raise ValueError(
+                "output_batch_size_per_model must match batch_size_per_dp: "
+                f"{len(output_batch_sizes)} != {len(self.batch_size_per_dp)}"
+            )
+        object.__setattr__(self, "output_batch_size_per_model", output_batch_sizes)
 
 
 @dataclass(frozen=True)
@@ -479,6 +495,12 @@ class TTAsyncDecodeController:
         batch_size_per_dp = model_input.unpadded_batch_size
         if not isinstance(batch_size_per_dp, list):
             batch_size_per_dp = [batch_size_per_dp]
+        if len(batch_size_per_dp) == 1:
+            output_batch_size_per_model = (int(model_input.input_tokens.shape[0]),)
+        else:
+            # The opt-in GPT-OSS hook is DP=1. Preserve the existing per-rank
+            # contract for sparse lane/multi-model decodes.
+            output_batch_size_per_model = tuple(batch_size_per_dp)
 
         sampling_params = model_input.tt_sampling_params
         perform_device_sampling = model_input.perform_device_sampling
@@ -489,6 +511,7 @@ class TTAsyncDecodeController:
                 batch_size_per_dp=batch_size_per_dp,
                 sampling_params=sampling_params,
                 perform_device_sampling=perform_device_sampling,
+                output_batch_size_per_model=output_batch_size_per_model,
             )
 
         kwargs: dict[str, Any] = {
@@ -577,6 +600,7 @@ class TTAsyncDecodeController:
             batch_size_per_dp=batch_size_per_dp,
             sampling_params=sampling_params,
             perform_device_sampling=perform_device_sampling,
+            output_batch_size_per_model=output_batch_size_per_model,
         )
 
     def finalize_decode(
@@ -595,7 +619,20 @@ class TTAsyncDecodeController:
             tt_out = submission.tt_out
 
         is_host_output = _is_host_decode_output(tt_out)
-        if not is_host_output and hasattr(runner.model, "process_decode_output_host"):
+        batch_processor = getattr(
+            runner.model, "process_decode_output_host_for_batch", None
+        )
+        if (
+            not is_host_output
+            and not submission.perform_device_sampling
+            and batch_processor is not None
+        ):
+            tt_out = batch_processor(
+                tt_out,
+                batch_size_per_model=submission.output_batch_size_per_model,
+                is_tokens=False,
+            )
+        elif not is_host_output and hasattr(runner.model, "process_decode_output_host"):
             tt_out = runner.model.process_decode_output_host(
                 tt_out,
                 is_tokens=submission.perform_device_sampling,

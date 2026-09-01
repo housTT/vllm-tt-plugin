@@ -416,6 +416,74 @@ def test_submit_decode_forwards_slot_remap_to_model(perform_device_sampling):
     assert ("sampling_params" in captured) is perform_device_sampling
 
 
+def test_submit_decode_leaves_sparse_lane_widths_on_the_legacy_contract():
+    class FakeModel:
+        @staticmethod
+        def decode_forward(**kwargs):
+            return torch.zeros((1, 1), dtype=torch.float32)
+
+    runner = SimpleNamespace(
+        kv_caches=object(),
+        trace_mode="none",
+        request_specific_rope=False,
+        model=FakeModel(),
+    )
+    model_input = SimpleNamespace(
+        input_tokens=torch.zeros((4, 1), dtype=torch.int32),
+        block_tables=torch.zeros((4, 1), dtype=torch.int32),
+        input_positions=torch.zeros((4,), dtype=torch.int32),
+        block_tables_per_layer=None,
+        unpadded_batch_size=[0, 1],
+        tt_sampling_params=_sampling_params(rows=4),
+        perform_device_sampling=False,
+        prompt_tokens=None,
+        output_tokens=None,
+        reset_batch=False,
+        slot_remap=None,
+    )
+
+    submission = TTAsyncDecodeController(runner).submit_decode(
+        model_input, read_from_device=True
+    )
+
+    assert submission.batch_size_per_dp == (0, 1)
+    assert submission.output_batch_size_per_model == (0, 1)
+
+
+def test_submit_decode_snapshots_single_model_wire_width():
+    class FakeModel:
+        @staticmethod
+        def decode_forward(**kwargs):
+            return torch.zeros((1, 1), dtype=torch.float32)
+
+    runner = SimpleNamespace(
+        kv_caches=object(),
+        trace_mode="none",
+        request_specific_rope=False,
+        model=FakeModel(),
+    )
+    model_input = SimpleNamespace(
+        input_tokens=torch.zeros((32, 1), dtype=torch.int32),
+        block_tables=torch.zeros((32, 1), dtype=torch.int32),
+        input_positions=torch.zeros((32,), dtype=torch.int32),
+        block_tables_per_layer=None,
+        unpadded_batch_size=2,
+        tt_sampling_params=_sampling_params(rows=32),
+        perform_device_sampling=False,
+        prompt_tokens=None,
+        output_tokens=None,
+        reset_batch=False,
+        slot_remap=None,
+    )
+
+    submission = TTAsyncDecodeController(runner).submit_decode(
+        model_input, read_from_device=True
+    )
+
+    assert submission.batch_size_per_dp == (2,)
+    assert submission.output_batch_size_per_model == (32,)
+
+
 def test_async_lane_decode_uses_batch_extraction():
     calls = []
 
@@ -469,3 +537,90 @@ def test_async_lane_decode_uses_batch_extraction():
     assert seen_model_input is model_input
     assert scheduled_rows == [4]
     assert is_decode is True
+
+
+def test_finalize_decode_uses_the_immutable_submission_batch_for_host_logits():
+    """Deferred B1/B32 completions must not reconstruct logits at a global width."""
+
+    calls = []
+
+    class RawHostRead:
+        def __init__(self, values):
+            self.values = values
+
+    class BatchAwareModel:
+        def process_decode_output_host_for_batch(
+            self, output, *, batch_size_per_model, is_tokens
+        ):
+            calls.append((tuple(batch_size_per_model), is_tokens))
+            batch = batch_size_per_model[0]
+            return output.values.view(batch, 1, -1)
+
+        @staticmethod
+        def process_decode_output_host(output, *, is_tokens):
+            raise AssertionError(
+                "legacy processing loses the submitted B1/B32 decode width"
+            )
+
+    controller = TTAsyncDecodeController(SimpleNamespace(model=BatchAwareModel()))
+    sampling = SimpleNamespace(enable_log_probs=torch.tensor([False]))
+    b1_widths = [1]
+    b1 = TTDecodeSubmission(
+        tt_out=RawHostRead(torch.zeros(1, 1, 1, 201_088)),
+        read_events=None,
+        batch_size_per_dp=b1_widths,
+        output_batch_size_per_model=(1,),
+        sampling_params=sampling,
+        perform_device_sampling=False,
+    )
+    b1_widths[0] = 32
+    b2_on_b32 = TTDecodeSubmission(
+        tt_out=RawHostRead(torch.zeros(1, 1, 32, 8)),
+        read_events=None,
+        batch_size_per_dp=[2],
+        output_batch_size_per_model=(32,),
+        sampling_params=sampling,
+        perform_device_sampling=False,
+    )
+
+    # Finalize out of submission order: each result must use its own snapshot.
+    finalized_b32 = controller.finalize_decode(b2_on_b32)
+    finalized_b1 = controller.finalize_decode(b1)
+
+    assert finalized_b32.tt_out.shape == (32, 1, 8)
+    assert finalized_b1.tt_out.shape == (1, 1, 201_088)
+    assert b1.batch_size_per_dp == (1,)
+    assert calls == [((32,), False), ((1,), False)]
+
+
+def test_device_sampled_decode_keeps_legacy_host_processing_path():
+    calls = []
+
+    class RawHostRead:
+        pass
+
+    class Model:
+        @staticmethod
+        def process_decode_output_host_for_batch(*args, **kwargs):
+            raise AssertionError("device tokens must not use the logits-only hook")
+
+        @staticmethod
+        def process_decode_output_host(output, *, is_tokens):
+            calls.append((output, is_tokens))
+            return torch.tensor([7], dtype=torch.int32)
+
+    raw = RawHostRead()
+    controller = TTAsyncDecodeController(SimpleNamespace(model=Model()))
+    submission = TTDecodeSubmission(
+        tt_out=raw,
+        read_events=None,
+        batch_size_per_dp=[1],
+        output_batch_size_per_model=(1,),
+        sampling_params=SimpleNamespace(enable_log_probs=torch.tensor([False])),
+        perform_device_sampling=True,
+    )
+
+    finalized = controller.finalize_decode(submission)
+
+    assert finalized.tt_out.tolist() == [7]
+    assert calls == [(raw, True)]
