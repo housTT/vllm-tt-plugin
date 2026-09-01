@@ -5,12 +5,14 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from vllm_tt_plugin.input_batch import InputBatch
+from vllm_tt_plugin.model_input import TTModelInput, slice_tt_sampling_params
 from vllm_tt_plugin.model_runner import TTModelRunner
 
 # region Constants
@@ -74,6 +76,54 @@ def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamesp
     )
 
 
+def _batch_with_sampling_params(
+    sampling_params: SamplingParams,
+    *,
+    vocab_size: int = VOCAB_SIZE,
+) -> tuple[InputBatch, CachedRequestState]:
+    generator = None
+    if sampling_params.seed is not None:
+        generator = torch.Generator().manual_seed(sampling_params.seed)
+    batch = InputBatch(
+        max_num_reqs=MAX_NUM_REQS,
+        max_model_len=MAX_MODEL_LEN,
+        max_num_batched_tokens=MAX_MODEL_LEN,
+        vocab_size=vocab_size,
+        block_sizes=[BLOCK_SIZE],
+        kernel_block_sizes=[BLOCK_SIZE],
+    )
+    request = CachedRequestState(
+        req_id="r",
+        prompt_token_ids=[1],
+        mm_features=None,
+        sampling_params=sampling_params,
+        generator=generator,
+        block_ids=([0],),
+        num_computed_tokens=1,
+        output_token_ids=[],
+    )
+    batch.add_request(request)
+    return batch, request
+
+
+def _device_sampling_runner(
+    batch: InputBatch,
+    model_capabilities: dict | None,
+) -> SimpleNamespace:
+    model = SimpleNamespace()
+    if model_capabilities is not None:
+        model.model_capabilities = model_capabilities
+    return SimpleNamespace(
+        sample_on_device_mode="all",
+        num_devices=4,
+        tt_data_parallel_size=1,
+        input_batch=batch,
+        model=model,
+        model_config=SimpleNamespace(logits_processors=None),
+        supports_topk_logprobs=True,
+    )
+
+
 def _prepare(runner, *rows):
     """Run _prepare_model_inputs for cached rows of
     (req_id, num_scheduled, num_computed, num_output)."""
@@ -93,6 +143,157 @@ def _prepare(runner, *rows):
 
 
 # endregion Test helpers
+
+# region Device sampling policy
+
+
+@pytest.mark.parametrize("top_k", [-1, VOCAB_SIZE])
+def test_model_top_k_capability_routes_unrestricted_sampling_to_host(top_k: int):
+    batch, request = _batch_with_sampling_params(
+        SamplingParams(temperature=1.0, top_p=1.0, top_k=top_k)
+    )
+    runner = _device_sampling_runner(
+        batch,
+        {"max_device_sampling_top_k": 32},
+    )
+
+    assert request.sampling_params.top_k == top_k
+    assert batch.sampling.top_k[0].item() == VOCAB_SIZE
+    assert not TTModelRunner.check_perform_device_sampling(
+        runner,
+        is_decode=True,
+        has_structured_outputs=False,
+    )
+
+
+@pytest.mark.parametrize("top_k", [1, 32])
+def test_model_top_k_capability_keeps_supported_sampling_on_device(top_k: int):
+    batch, _ = _batch_with_sampling_params(
+        SamplingParams(temperature=0.0 if top_k == 1 else 1.0, top_k=top_k)
+    )
+    runner = _device_sampling_runner(
+        batch,
+        {"max_device_sampling_top_k": 32},
+    )
+
+    assert TTModelRunner.check_perform_device_sampling(
+        runner,
+        is_decode=True,
+        has_structured_outputs=False,
+    )
+
+
+def test_model_without_top_k_capability_keeps_existing_device_policy():
+    batch, _ = _batch_with_sampling_params(
+        SamplingParams(temperature=1.0, top_p=1.0, top_k=-1)
+    )
+    runner = _device_sampling_runner(batch, None)
+
+    assert TTModelRunner.check_perform_device_sampling(
+        runner,
+        is_decode=True,
+        has_structured_outputs=False,
+    )
+
+
+def test_supported_top_k_preserves_device_penalties_and_seed():
+    batch, _ = _batch_with_sampling_params(
+        SamplingParams(
+            temperature=1.0,
+            top_k=32,
+            seed=42,
+            presence_penalty=0.25,
+            frequency_penalty=0.5,
+            repetition_penalty=1.125,
+        )
+    )
+    runner = _device_sampling_runner(
+        batch,
+        {"max_device_sampling_top_k": 32},
+    )
+
+    assert TTModelRunner.check_perform_device_sampling(
+        runner,
+        is_decode=True,
+        has_structured_outputs=False,
+    )
+    assert batch.sampling.seed[0].item() == 42
+    assert batch.sampling.presence_penalty[0].item() == 0.25
+    assert batch.sampling.frequency_penalty[0].item() == 0.5
+    assert batch.sampling.repetition_penalty[0].item() == 1.125
+
+
+def test_host_fallback_receives_unrestricted_sampling_semantics():
+    batch, request = _batch_with_sampling_params(
+        SamplingParams(
+            temperature=1.0,
+            top_p=1.0,
+            top_k=-1,
+            seed=42,
+        )
+    )
+    captured = {}
+
+    def capture_host_sampling(*, logits, sampling_metadata):
+        captured["logits"] = logits
+        captured["sampling_metadata"] = sampling_metadata
+        return SimpleNamespace(
+            sampled_token_ids=torch.tensor([[7]], dtype=torch.int32),
+            logprobs_tensors=None,
+        )
+
+    sampling_params = slice_tt_sampling_params(batch.sampling, [0])
+    model_input = TTModelInput(
+        input_tokens=torch.tensor([[1]], dtype=torch.int32),
+        input_positions=torch.tensor([0], dtype=torch.int32),
+        prompt_lens=None,
+        block_tables=torch.zeros((1, 1), dtype=torch.int32),
+        block_tables_per_group=[torch.zeros((1, 1), dtype=torch.int32)],
+        block_tables_per_layer=None,
+        unpadded_batch_size=1,
+        tt_sampling_params=sampling_params,
+        multi_modal_kwargs={},
+        perform_device_sampling=False,
+        grammar_bitmask=[None],
+        logitsprocs_list=[None],
+        bad_words_token_ids_list=[{}],
+        allowed_token_ids_mask_list=[None],
+        generators_list=[dict(batch.sampling.generators)],
+        max_num_logprobs=[None],
+    )
+    runner = SimpleNamespace(
+        _output_tokens_per_step=1,
+        _is_block_output_model=False,
+        _is_lane_mode=False,
+        tt_per_lane_max_num_seqs=MAX_NUM_REQS,
+        vocab_size=VOCAB_SIZE,
+        host_sampler=capture_host_sampling,
+    )
+    logits = torch.linspace(-1.0, 1.0, VOCAB_SIZE).reshape(1, 1, -1)
+
+    sampled, logprobs = TTModelRunner._get_output_tokens(
+        runner,
+        tt_out=logits,
+        tt_log_probs=None,
+        sampling_params=sampling_params,
+        model_input=model_input,
+        batch_size_per_dp=[1],
+        perform_device_sampling=False,
+        is_decode=True,
+    )
+
+    metadata = captured["sampling_metadata"]
+    assert request.sampling_params.top_k == -1
+    assert metadata.top_k.tolist() == [VOCAB_SIZE]
+    assert metadata.top_p.tolist() == [1.0]
+    assert metadata.temperature.tolist() == [1.0]
+    assert metadata.generators[0].initial_seed() == 42
+    assert torch.equal(captured["logits"], logits[:, -1, :])
+    assert sampled[0].tolist() == [[7]]
+    assert logprobs == [None]
+
+
+# endregion Device sampling policy
 
 # region Prefill classification
 

@@ -1890,6 +1890,28 @@ class TTModelRunner:
         if has_always_host_only_sampling_params:
             return False
 
+        # Models may expose a stricter on-device top-k limit than vLLM's host
+        # sampler. InputBatch normalizes an unrestricted request (top_k <= 0)
+        # to vocab_size, so comparing the live rows against this capability
+        # preserves exact upstream semantics by routing unsupported requests to
+        # the host instead of silently narrowing their candidate set. Inspect
+        # req_id_to_index rather than a leading slice because lane-DP batches
+        # keep live requests in stable, potentially sparse rows.
+        model_capabilities = getattr(
+            getattr(self, "model", None), "model_capabilities", None
+        )
+        max_device_sampling_top_k = (
+            model_capabilities.get("max_device_sampling_top_k")
+            if model_capabilities
+            else None
+        )
+        if max_device_sampling_top_k is not None and any(
+            input_batch.sampling.temperature[row].item() != 0.0
+            and int(input_batch.sampling.top_k[row].item()) > max_device_sampling_top_k
+            for row in input_batch.req_id_to_index.values()
+        ):
+            return False
+
         # Structured outputs are not supported on device yet
         # https://github.com/tenstorrent/vllm/issues/277
         if has_structured_outputs:
@@ -2240,9 +2262,9 @@ class TTModelRunner:
                 # Capture logprobs for this DP rank
                 logprobs_per_dp.append(sampler_output.logprobs_tensors)
             else:  # sample on device
-                assert (
-                    model_input.grammar_bitmask[dp_rank] is None
-                ), "grammar bitmask is set but device sampling can't apply it"
+                assert model_input.grammar_bitmask[dp_rank] is None, (
+                    "grammar bitmask is set but device sampling can't apply it"
+                )
 
                 next_token_ids = _take(tt_out).reshape(sz, -1)
                 if next_token_ids.shape[1] != self._output_tokens_per_step:

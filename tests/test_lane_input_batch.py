@@ -31,6 +31,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from vllm_tt_plugin.input_batch import InputBatch, TTLaneInputBatch
+from vllm_tt_plugin.model_runner import TTModelRunner
 
 VOCAB = 64
 BLOCK = 16
@@ -135,6 +136,64 @@ def test_requests_land_in_their_lane_chunk():
     assert r1 == 4  # lane 1 chunk base
     assert b.occupied_rows() == [0, 1, 4]
     assert b.lane_of("b") == 1
+
+
+def test_sparse_lane_unsupported_top_k_forces_whole_batch_host_sampling():
+    batch = _lane_batch(num_lanes=2, per_lane=2, with_custom=False)
+    batch.add_request_to_row(
+        _make_req("supported", [1], [], dict(temperature=1.0, top_k=32)),
+        0,
+    )
+    batch.add_request_to_row(
+        _make_req("unrestricted", [2], [], dict(temperature=1.0, top_k=-1)),
+        3,
+    )
+    runner = SimpleNamespace(
+        sample_on_device_mode="all",
+        num_devices=4,
+        tt_data_parallel_size=1,
+        input_batch=batch,
+        model=SimpleNamespace(model_capabilities={"max_device_sampling_top_k": 32}),
+        model_config=SimpleNamespace(logits_processors=None),
+        supports_topk_logprobs=True,
+    )
+
+    assert batch.occupied_rows() == [0, 3]
+    assert batch.sampling.top_k.tolist() == [32, 1, 1, VOCAB]
+    assert not TTModelRunner.check_perform_device_sampling(
+        runner,
+        is_decode=True,
+        has_structured_outputs=False,
+    )
+
+
+def test_sparse_lane_supported_top_k_keeps_whole_batch_device_sampling():
+    batch = _lane_batch(num_lanes=2, per_lane=2, with_custom=False)
+    batch.add_request_to_row(
+        _make_req("greedy", [1], [], dict(temperature=0.0, top_k=1)),
+        0,
+    )
+    batch.add_request_to_row(
+        _make_req("supported", [2], [], dict(temperature=1.0, top_k=32)),
+        3,
+    )
+    runner = SimpleNamespace(
+        sample_on_device_mode="all",
+        num_devices=4,
+        tt_data_parallel_size=1,
+        input_batch=batch,
+        model=SimpleNamespace(model_capabilities={"max_device_sampling_top_k": 32}),
+        model_config=SimpleNamespace(logits_processors=None),
+        supports_topk_logprobs=True,
+    )
+
+    assert batch.occupied_rows() == [0, 3]
+    assert batch.sampling.top_k.tolist() == [VOCAB, 1, 1, 32]
+    assert TTModelRunner.check_perform_device_sampling(
+        runner,
+        is_decode=True,
+        has_structured_outputs=False,
+    )
 
 
 def test_existing_requests_keep_row_on_admission_and_removal():
