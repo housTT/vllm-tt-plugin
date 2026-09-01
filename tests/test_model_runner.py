@@ -293,6 +293,36 @@ def test_host_fallback_receives_unrestricted_sampling_semantics():
     assert logprobs == [None]
 
 
+def test_model_decode_buckets_keep_singleton_host_fallback_at_width_one():
+    batch, request = _batch_with_sampling_params(
+        SamplingParams(temperature=1.0, top_p=1.0, top_k=-1, seed=42)
+    )
+    runner = _fake_runner(batch, request)
+    runner.model = SimpleNamespace(tt_supported_decode_batch_sizes=(1, 32))
+    runner.check_perform_device_sampling = (
+        lambda **_: TTModelRunner.check_perform_device_sampling(
+            _device_sampling_runner(
+                batch,
+                {"max_device_sampling_top_k": 32},
+            ),
+            is_decode=True,
+            has_structured_outputs=False,
+        )
+    )
+    runner._decode_layout_changed_since_last_decode = True
+    runner._decode_layout_change_removal_only = False
+
+    model_input = _prepare(runner, ("r", 1, 1, 0))
+
+    assert model_input.perform_device_sampling is False
+    assert model_input.unpadded_batch_size == 1
+    assert model_input.input_tokens.shape == (1, 1)
+    assert model_input.input_positions.shape == (1,)
+    assert model_input.block_tables.shape[0] == 1
+    assert model_input.tt_sampling_params.top_k.tolist() == [VOCAB_SIZE]
+    assert model_input.tt_sampling_params.seed.tolist() == [42]
+
+
 # endregion Device sampling policy
 
 # region Prefill classification
