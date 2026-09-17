@@ -127,6 +127,12 @@ class TTModelInput:
     # identity. Shape: [total_B].
     slot_remap: torch.Tensor | None = None
 
+    # Monotonic host-state versions. Opt-in model adapters can use these
+    # instead of materializing sampling tensors and comparing every repeated
+    # hybrid page table on each steady decode step.
+    sampling_state_id: int | None = None
+    page_table_state_id: int | None = None
+
     # Prefill-only: the device state slot each prefilling row writes to. Global for
     # single-process DP (supplied by the scheduler-owned step plan), local otherwise.
     prefill_empty_slots: list[int] | None = None

@@ -262,6 +262,8 @@ class InputBatch:
         # no-op, so ``pop_slot_remap``'s one caller always reads the identity; the
         # non-lane path resets it and uses ``_req_state_slot``, which subsumes it.
         self._slot_remap = torch.arange(max_num_reqs, dtype=torch.int32)
+        self.sampling_state_id = 0
+        self.page_table_state_id = 0
 
     def reset_slot_remap(self) -> None:
         """Drop any pending slot remap; the identity from here."""
@@ -460,6 +462,8 @@ class InputBatch:
             self.sampling.bad_words_token_ids[req_index] = (
                 sampling_params.bad_words_token_ids
             )
+        self.sampling_state_id += 1
+        self.page_table_state_id += 1
 
     def remove_request(self, req_id: str) -> int | None:
         """This method must always be followed by a call to condense()."""
@@ -486,6 +490,9 @@ class InputBatch:
         if self.sampling.allowed_token_ids_mask is not None:
             self.sampling.allowed_token_ids_mask[req_index] = False
 
+        self.sampling_state_id += 1
+        self.page_table_state_id += 1
+
         return req_index
 
     def condense(self, empty_req_indices: list[int]) -> None:
@@ -504,6 +511,7 @@ class InputBatch:
         # NOTE(woosuk): This function assumes that the empty_req_indices
         # is sorted in descending order.
         last_req_index = num_reqs + len(empty_req_indices) - 1
+        moved = False
         while empty_req_indices:
             # Find the largest non-empty index.
             while last_req_index in empty_req_indices:
@@ -541,6 +549,7 @@ class InputBatch:
                 last_req_index
             ]
             self.block_table.move_row(last_req_index, empty_index)
+            moved = True
 
             # Sampling-related.
             sampling = self.sampling
@@ -582,6 +591,9 @@ class InputBatch:
         # Trim lists to the batch size.
         del self._req_ids[self.num_reqs :]
         del self.req_output_token_ids[self.num_reqs :]
+        if moved:
+            self.sampling_state_id += 1
+            self.page_table_state_id += 1
 
     @property
     def max_num_logprobs(self) -> int | None:
@@ -956,6 +968,7 @@ class TTLaneInputBatch(InputBatch):
             self.num_computed_tokens_cpu[req_index] = num_computed_tokens
             if new_block_ids is not None:
                 self.block_table.append_row(new_block_ids, req_index)
+                self.page_table_state_id += 1
 
         # Place new / resumed requests at scheduler-owned stable rows.
         for req_id in req_ids_to_add:
@@ -1234,6 +1247,8 @@ class TTLaneInputBatch(InputBatch):
             output_tokens=output_tokens,
             reset_batch=reset_batch,
             slot_remap=slot_remap,
+            sampling_state_id=lane_batch.sampling_state_id,
+            page_table_state_id=lane_batch.page_table_state_id,
             # Host sampling reads the merged batch directly (see
             # ``extract_output``); the per-rank sidecars are unused here.
             allowed_token_ids_mask_list=[None],
@@ -1333,6 +1348,8 @@ class TTLaneInputBatch(InputBatch):
             output_tokens=output_tokens,
             reset_batch=False,
             slot_remap=None,
+            sampling_state_id=lane_batch.sampling_state_id,
+            page_table_state_id=lane_batch.page_table_state_id,
             allowed_token_ids_mask_list=[None],
             bad_words_token_ids_list=[{}],
             max_num_logprobs=[lane_batch.max_num_logprobs],

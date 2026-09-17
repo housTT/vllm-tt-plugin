@@ -749,6 +749,7 @@ class TTModelRunner:
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
             if new_block_ids is not None:
                 self.input_batch.block_table.append_row(new_block_ids, req_index)
+                self.input_batch.page_table_state_id += 1
 
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
@@ -1417,6 +1418,8 @@ class TTModelRunner:
             reset_batch=reset_batch,
             removal_only_reset=(removal_only_reset if not is_prompt else False),
             slot_remap=slot_remap,
+            sampling_state_id=input_batch.sampling_state_id,
+            page_table_state_id=input_batch.page_table_state_id,
             # Host-only sampling params - wrapped in lists for DP compatibility
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
             bad_words_token_ids_list=[bad_words_token_ids],

@@ -528,19 +528,30 @@ class TTAsyncDecodeController:
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
         if perform_device_sampling:
-            sampling_param_dict = {
-                field.name: (
-                    getattr(sampling_params, field.name).tolist()
-                    if getattr(sampling_params, field.name) is not None
-                    else None
+            capabilities = getattr(runner.model, "model_capabilities", {})
+            if capabilities.get("accepts_tensor_sampling_params", False):
+                kwargs["sampling_params"] = sampling_params
+            else:
+                sampling_param_dict = {
+                    field.name: (
+                        getattr(sampling_params, field.name).tolist()
+                        if getattr(sampling_params, field.name) is not None
+                        else None
+                    )
+                    for field in fields(sampling_params)
+                }
+                sampling_param_dict["seed"] = [
+                    None if s == SEED_NONE_SENTINEL else s
+                    for s in sampling_param_dict["seed"]
+                ]
+                kwargs["sampling_params"] = type(sampling_params)(**sampling_param_dict)
+            if capabilities.get("accepts_serving_state_ids", False):
+                kwargs["sampling_state_id"] = getattr(
+                    model_input, "sampling_state_id", None
                 )
-                for field in fields(sampling_params)
-            }
-            sampling_param_dict["seed"] = [
-                None if s == SEED_NONE_SENTINEL else s
-                for s in sampling_param_dict["seed"]
-            ]
-            kwargs["sampling_params"] = type(sampling_params)(**sampling_param_dict)
+                kwargs["page_table_state_id"] = getattr(
+                    model_input, "page_table_state_id", None
+                )
             if model_input.prompt_tokens is not None:
                 assert model_input.output_tokens is not None
                 kwargs["prompt_tokens"] = model_input.prompt_tokens

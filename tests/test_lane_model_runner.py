@@ -416,6 +416,49 @@ def test_submit_decode_forwards_slot_remap_to_model(perform_device_sampling):
     assert ("sampling_params" in captured) is perform_device_sampling
 
 
+def test_submit_decode_defers_tensor_sampling_materialization_for_capable_model():
+    captured: dict = {}
+
+    class FakeModel:
+        model_capabilities = {
+            "accepts_tensor_sampling_params": True,
+            "accepts_serving_state_ids": True,
+        }
+
+        def decode_forward(self, **kwargs):
+            captured.update(kwargs)
+            return torch.zeros((1, 1), dtype=torch.float32)
+
+    runner = SimpleNamespace(
+        kv_caches=object(),
+        trace_mode="none",
+        request_specific_rope=False,
+        model=FakeModel(),
+    )
+    params = _sampling_params()
+    model_input = SimpleNamespace(
+        input_tokens=torch.zeros((2, 1), dtype=torch.int32),
+        block_tables=torch.zeros((2, 1), dtype=torch.int32),
+        input_positions=torch.zeros((2,), dtype=torch.int32),
+        block_tables_per_layer=None,
+        unpadded_batch_size=2,
+        tt_sampling_params=params,
+        perform_device_sampling=True,
+        prompt_tokens=None,
+        output_tokens=None,
+        reset_batch=False,
+        slot_remap=None,
+        sampling_state_id=7,
+        page_table_state_id=11,
+    )
+
+    TTAsyncDecodeController(runner).submit_decode(model_input, read_from_device=True)
+
+    assert captured["sampling_params"] is params
+    assert captured["sampling_state_id"] == 7
+    assert captured["page_table_state_id"] == 11
+
+
 def test_submit_decode_leaves_sparse_lane_widths_on_the_legacy_contract():
     class FakeModel:
         @staticmethod
