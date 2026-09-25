@@ -633,10 +633,15 @@ def register_tt_models(register_test_models=False) -> None:
         path_qwen35_text = (
             "models.demos.blackhole.qwen36.tt.qwen36_vllm:Qwen36ForCausalLM"
         )
+    elif qwen35_text_version == "autoport_qwen36_27b":
+        path_qwen35_text = (
+            "models.autoports.qwen_qwen3_6_27b.tt.generator_vllm:"
+            "Qwen3_5ForConditionalGeneration"
+        )
     else:
         raise ValueError(
             f"Unsupported TT Qwen3.5 version: {qwen35_text_version}, "
-            "pick one of [qwen36_blackhole]"
+            "pick one of [qwen36_blackhole, autoport_qwen36_27b]"
         )
 
     _register_model_if_missing(
@@ -1195,7 +1200,22 @@ class TTPlatform(Platform):
                 uses_sliding_window = (
                     vllm_config.model_config.get_sliding_window() is not None
                 )
-                if uses_sliding_window:
+                # Pairing a windowed model with prefix caching is unsafe by default:
+                # a model that writes absolute cache positions, against vLLM's
+                # sliding page table (zero-padded past sliding_window / block_size),
+                # aliases onto physical block 0 and corrupts the cache with no error.
+                # Several models set `supports_prefix_caching` and depend on this
+                # refusal, so relaxing it needs a *second*, explicit declaration from
+                # a model that has actually implemented a windowed resume -- not the
+                # generic capability.
+                supports_windowed_prefix_caching = (
+                    model_capabilities.get(
+                        "supports_prefix_caching_with_sliding_window", False
+                    )
+                    if model_capabilities
+                    else False
+                )
+                if uses_sliding_window and not supports_windowed_prefix_caching:
                     vllm_config.cache_config.enable_prefix_caching = False
                     logger.warning(
                         "Prefix caching is not supported in TT backend for "
