@@ -54,7 +54,7 @@ _GALAXY_GENERATOR_VERSIONS = {
 
 # HF ``model_type`` values whose tt-metal generator accepts a ``chunk_start_idx``
 # prefill, i.e. the ones token-chunked prefill has been validated against.
-_CHUNKED_PREFILL_MODEL_TYPES = {"gemma4", "gemma4_unified"}
+_CHUNKED_PREFILL_MODEL_TYPES = {"gemma4", "gemma4_unified", "qwen4_exp"}
 
 
 def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:

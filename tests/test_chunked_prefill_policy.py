@@ -53,6 +53,21 @@ def test_unified_gemma4_checkpoint_also_keeps_chunked_prefill():
     assert config.scheduler_config.enable_chunked_prefill is True
 
 
+def test_qwen4_exp_keeps_chunked_prefill_and_its_token_budget():
+    config = _vllm_config(
+        model_type="qwen4_exp",
+        max_num_batched_tokens=1024,
+        max_model_len=262144,
+    )
+
+    _apply_chunked_prefill_policy(config)
+
+    assert config.scheduler_config.enable_chunked_prefill is True
+    assert config.scheduler_config.max_num_batched_tokens == 1024
+    assert config.scheduler_config.long_prefill_token_threshold == 512
+    assert config.scheduler_config.disable_chunked_mm_input is True
+
+
 def test_other_model_type_loses_chunked_prefill_and_gets_a_full_prompt_budget():
     config = _vllm_config(model_type="llama")
 
