@@ -136,6 +136,7 @@ class TTModelInput:
     # Prefill-only: the device state slot each prefilling row writes to. Global for
     # single-process DP (supplied by the scheduler-owned step plan), local otherwise.
     prefill_empty_slots: list[int] | None = None
+    prefill_new_rows: list[bool] | None = None
 
     # Prefill only: rows whose forward writes KV state but must not emit a
     # sampled token, because more prompt tokens remain after this chunk.

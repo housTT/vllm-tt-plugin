@@ -87,6 +87,8 @@ class TTScheduler(AsyncScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._forced_mode = TTSchedulingMode.DEFAULT
+        self._decode_steps_owed = 0
+        self._install_prefix_cache_alignment()
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
         if self._is_block_output_model:
@@ -371,6 +373,12 @@ class TTScheduler(AsyncScheduler):
         # Prefer prefill whenever prefill work is pending, so new requests are
         # admitted and partial prefills advance.
         if has_pending_prefill:
+            owed = getattr(self, "_decode_steps_owed", 0)
+            if owed > 0 and has_running_decode:
+                self._decode_steps_owed = owed - 1
+                result = self._schedule_decode_only()
+                return self._finalize_scheduler_output(result)
+            self._decode_steps_owed = 0
             prefill_result = self._schedule_prefill_only()
             # If prefill cannot make progress (e.g. KV pressure), do not stall
             # decode. Fall back to decode-only so running requests can advance
@@ -378,6 +386,8 @@ class TTScheduler(AsyncScheduler):
             if prefill_result.total_num_scheduled_tokens == 0 and has_running_decode:
                 result = self._schedule_decode_only()
                 return self._finalize_scheduler_output(result)
+            if has_running_decode and any(request.is_prefill_chunk for request in self.running):
+                self._decode_steps_owed = self._chunked_prefill_decode_steps()
             return self._finalize_scheduler_output(prefill_result)
 
         # No pending prefill work in default mode: run decode-only naturally.
@@ -388,6 +398,91 @@ class TTScheduler(AsyncScheduler):
         self, scheduler_output: SchedulerOutput
     ) -> SchedulerOutput:
         return scheduler_output
+
+    def _prefill_chunk_alignment(self) -> int:
+        """Token alignment for chunk ends and prefix-cache hits (1 = block size only)."""
+
+        vllm_config = getattr(self, "vllm_config", None)
+        if vllm_config is None:
+            return 1
+        try:
+            from vllm_tt_plugin.config import get_tt_config
+
+            return max(1, int(get_tt_config(vllm_config).get("prefill_chunk_alignment", 1)))
+        except (TypeError, ValueError):
+            return 1
+
+    def _mamba_block_aligned_split(
+        self,
+        request,
+        num_new_tokens,
+        num_new_local_computed_tokens=0,
+        num_external_computed_tokens=0,
+    ):
+        alignment = getattr(self, "_chunk_alignment", 1)
+        if alignment <= 1:
+            return super()._mamba_block_aligned_split(
+                request, num_new_tokens, num_new_local_computed_tokens, num_external_computed_tokens
+            )
+        start = request.num_computed_tokens + num_new_local_computed_tokens + num_external_computed_tokens
+        end = start + num_new_tokens
+        if end >= max(request.num_prompt_tokens, request.num_tokens - 1):
+            return num_new_tokens
+        return max(0, end - end % alignment - start)
+
+    def _install_prefix_cache_alignment(self) -> None:
+        """Make chunk ends and cache hits whole multiples of the model's alignment.
+
+        Chunk ends go through the base scheduler's split hook (a non-final chunk
+        that cannot reach the next boundary is deferred to a later step, so a
+        budget remnant never starts a request off-boundary); cache hits are
+        floored by wrapping the KV cache manager.
+        """
+
+        alignment = self._prefill_chunk_alignment()
+        self._chunk_alignment = alignment
+        if alignment > 1:
+            self.need_mamba_block_aligned_split = True
+        manager = getattr(self, "kv_cache_manager", None)
+        if alignment <= 1 or manager is None or not getattr(manager, "enable_caching", False):
+            return
+        original = manager.get_computed_blocks
+        groups = manager.kv_cache_config.kv_cache_groups
+
+        def aligned_get_computed_blocks(request):
+            blocks, computed, boundary = original(request)
+            keep = computed - computed % alignment
+            if keep == computed:
+                return blocks, computed, boundary
+            if keep == 0:
+                return manager.empty_kv_cache_blocks, 0, boundary
+            trimmed = type(blocks)(
+                tuple(
+                    list(group_blocks[: keep // group.kv_cache_spec.block_size])
+                    for group_blocks, group in zip(blocks.blocks, groups)
+                )
+            )
+            return trimmed, keep, boundary
+
+        manager.get_computed_blocks = aligned_get_computed_blocks
+
+    def _chunked_prefill_decode_steps(self) -> int:
+        """Decode-only steps run between two chunks of a partial prefill (0 = none)."""
+
+        cached = getattr(self, "_chunked_prefill_decode_steps_cached", None)
+        if cached is not None:
+            return cached
+        steps = 8
+        vllm_config = getattr(self, "vllm_config", None)
+        if vllm_config is not None:
+            try:
+                from vllm_tt_plugin.config import get_tt_config
+
+                steps = int(get_tt_config(vllm_config).get("chunked_prefill_decode_steps", steps))
+            except Exception:  # noqa: BLE001
+                steps = 8
+        self._chunked_prefill_decode_steps_cached = max(0, steps)
+        return self._chunked_prefill_decode_steps_cached
 
     def _schedule_prefill_only(self) -> SchedulerOutput:
         """Schedule prefill work: waiting requests and partial continuations.

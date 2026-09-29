@@ -138,3 +138,130 @@ def test_decode_only_hides_continuations_and_restores_them(monkeypatch):
 
     assert seen["running"] == [decode]
     assert scheduler.running == [decode, continuation]
+
+
+def test_decode_steps_run_between_the_chunks_of_a_partial_prefill(monkeypatch):
+    continuation = _running(is_prefill_chunk=True)
+    decode = _running()
+    scheduler = _scheduler(running=[decode, continuation], mode=TTSchedulingMode.DEFAULT)
+    scheduler._chunked_prefill_decode_steps_cached = 3
+    calls = []
+
+    def fake_prefill():
+        calls.append("prefill")
+        output = SchedulerOutput.make_empty()
+        output.total_num_scheduled_tokens = 8192
+        return output
+
+    monkeypatch.setattr(scheduler, "_schedule_prefill_only", fake_prefill)
+    monkeypatch.setattr(
+        scheduler, "_schedule_decode_only", lambda: calls.append("decode") or SchedulerOutput.make_empty()
+    )
+
+    for _ in range(9):
+        scheduler.schedule()
+
+    assert calls == ["prefill", "decode", "decode", "decode", "prefill", "decode", "decode", "decode", "prefill"]
+
+
+def test_no_decode_steps_are_owed_when_the_prefill_finished_or_nobody_decodes(monkeypatch):
+    fresh = _running()
+    scheduler = _scheduler(running=[fresh], waiting=1, mode=TTSchedulingMode.DEFAULT)
+    scheduler._chunked_prefill_decode_steps_cached = 3
+    calls = []
+
+    def fake_prefill():
+        calls.append("prefill")
+        output = SchedulerOutput.make_empty()
+        output.total_num_scheduled_tokens = 512
+        return output
+
+    monkeypatch.setattr(scheduler, "_schedule_prefill_only", fake_prefill)
+    monkeypatch.setattr(
+        scheduler, "_schedule_decode_only", lambda: calls.append("decode") or SchedulerOutput.make_empty()
+    )
+    scheduler.schedule()
+    scheduler.schedule()
+    assert calls == ["prefill", "prefill"]
+
+    only_partials = _scheduler(running=[_running(is_prefill_chunk=True)], mode=TTSchedulingMode.DEFAULT)
+    only_partials._chunked_prefill_decode_steps_cached = 3
+    seen = []
+    monkeypatch.setattr(
+        only_partials,
+        "_schedule_prefill_only",
+        lambda: seen.append("prefill") or SchedulerOutput.make_empty(),
+    )
+    monkeypatch.setattr(
+        only_partials,
+        "_schedule_decode_only",
+        lambda: seen.append("decode") or SchedulerOutput.make_empty(),
+    )
+    only_partials.schedule()
+    only_partials.schedule()
+    assert seen == ["prefill", "prefill"]
+
+
+def test_prefix_cache_hits_are_floored_to_the_model_alignment():
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+
+    blocks = [SimpleNamespace(block_id=i) for i in range(78)]
+    calls = []
+
+    def get_computed_blocks(request):
+        calls.append(request)
+        return KVCacheBlocks((blocks,)), 78 * 64, 0
+
+    manager = SimpleNamespace(
+        enable_caching=True,
+        get_computed_blocks=get_computed_blocks,
+        empty_kv_cache_blocks=KVCacheBlocks(((),)),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=64))]),
+    )
+    scheduler = TTScheduler.__new__(TTScheduler)
+    scheduler.vllm_config = SimpleNamespace(additional_config={"tt": {"prefill_chunk_alignment": 512}})
+    scheduler.kv_cache_manager = manager
+    scheduler._install_prefix_cache_alignment()
+
+    trimmed, computed, boundary = manager.get_computed_blocks("req")
+    assert computed == 4608 and boundary == 0
+    assert [b.block_id for b in trimmed.blocks[0]] == list(range(72))
+    assert calls == ["req"]
+
+    manager.get_computed_blocks = lambda request: (KVCacheBlocks((blocks[:4],)), 4 * 64, 0)
+    scheduler._install_prefix_cache_alignment()
+    empty, computed, _ = manager.get_computed_blocks("short")
+    assert computed == 0 and empty is manager.empty_kv_cache_blocks
+
+
+def test_prefix_cache_alignment_is_left_alone_without_the_knob_or_caching():
+    manager = SimpleNamespace(enable_caching=False, get_computed_blocks=lambda request: ("x", 100, 0))
+    scheduler = TTScheduler.__new__(TTScheduler)
+    scheduler.vllm_config = SimpleNamespace(additional_config={"tt": {"prefill_chunk_alignment": 512}})
+    scheduler.kv_cache_manager = manager
+    scheduler._install_prefix_cache_alignment()
+    assert manager.get_computed_blocks("r") == ("x", 100, 0)
+    manager.enable_caching = True
+    scheduler.vllm_config = SimpleNamespace(additional_config={"tt": {}})
+    scheduler._install_prefix_cache_alignment()
+    assert manager.get_computed_blocks("r") == ("x", 100, 0)
+
+
+def test_non_final_chunks_end_on_the_alignment_and_a_budget_remnant_defers():
+    scheduler = TTScheduler.__new__(TTScheduler)
+    scheduler.vllm_config = SimpleNamespace(additional_config={"tt": {"prefill_chunk_alignment": 512}})
+    scheduler.kv_cache_manager = SimpleNamespace(enable_caching=False)
+    scheduler._install_prefix_cache_alignment()
+    assert scheduler.need_mamba_block_aligned_split is True
+
+    long_prompt = SimpleNamespace(num_computed_tokens=0, num_prompt_tokens=130816, num_tokens=130816)
+    assert scheduler._mamba_block_aligned_split(long_prompt, 256) == 0
+    assert scheduler._mamba_block_aligned_split(long_prompt, 3192) == 3072
+    assert scheduler._mamba_block_aligned_split(long_prompt, 8192) == 8192
+    last_chunk = SimpleNamespace(num_computed_tokens=122880, num_prompt_tokens=130816, num_tokens=130816)
+    assert scheduler._mamba_block_aligned_split(last_chunk, 7936) == 7936
+    cache_hit = SimpleNamespace(num_computed_tokens=0, num_prompt_tokens=20000, num_tokens=20000)
+    assert scheduler._mamba_block_aligned_split(cache_hit, 8192, num_new_local_computed_tokens=4608) == 8192
+    assert scheduler._mamba_block_aligned_split(cache_hit, 8192, num_new_local_computed_tokens=4992) == 7808
+    decoding = SimpleNamespace(num_computed_tokens=20000, num_prompt_tokens=20000, num_tokens=20001)
+    assert scheduler._mamba_block_aligned_split(decoding, 1) == 1

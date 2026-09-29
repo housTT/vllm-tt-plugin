@@ -708,6 +708,31 @@ def test_startup_auto_disables_prefix_caching_for_block_models(monkeypatch):
     assert config.cache_config.enable_prefix_caching is False
 
 
+def test_startup_keeps_prefix_caching_for_a_sliding_window_model_that_declares_it(monkeypatch):
+    class SlidingWindowModelWithPrefixCaching(ARModel):
+        model_capabilities = {**ARModel.model_capabilities, "supports_prefix_caching": True}
+
+    config = _config()
+    config.model_config.get_sliding_window = lambda: 128
+    config.cache_config.enable_prefix_caching = True
+    _patch_model_resolution(monkeypatch, SlidingWindowModelWithPrefixCaching)
+
+    TTPlatform.check_and_update_config(config)
+
+    assert config.cache_config.enable_prefix_caching is True
+
+
+def test_startup_disables_prefix_caching_for_a_sliding_window_model_without_the_capability(monkeypatch):
+    config = _config()
+    config.model_config.get_sliding_window = lambda: 128
+    config.cache_config.enable_prefix_caching = True
+    _patch_model_resolution(monkeypatch, ARModel)
+
+    TTPlatform.check_and_update_config(config)
+
+    assert config.cache_config.enable_prefix_caching is False
+
+
 def test_startup_rejects_block_model_declaring_prefix_caching(monkeypatch):
     class BlockModelClaimingPrefixCaching(BlockModel):
         model_capabilities = {

@@ -553,3 +553,35 @@ def test_apply_sampled_token_updates_request_state():
 
 
 # endregion Output state
+
+
+def _slot_runner(n_slots: int, requests: dict) -> TTModelRunner:
+    runner = TTModelRunner.__new__(TTModelRunner)
+    runner.tt_per_lane_max_num_seqs = n_slots
+    runner._req_state_slot = {}
+    runner.requests = requests
+    return runner
+
+
+def test_chunked_prefill_continuation_keeps_its_device_slot():
+    runner = _slot_runner(4, {"A": object(), "B": object()})
+    assert runner._alloc_prefill_state_slots(["A"]) == [0]
+    assert runner._alloc_prefill_state_slots(["B", "A"]) == [1, 0]
+    assert runner._req_state_slot == {"A": 0, "B": 1}
+
+
+def test_prefill_slot_of_a_finished_request_is_free_for_a_new_one():
+    runner = _slot_runner(4, {"A": object()})
+    runner._alloc_prefill_state_slots(["A"])
+    runner.requests = {"C": object()}
+    runner._req_state_slot.pop("A")
+    assert runner._alloc_prefill_state_slots(["C"]) == [0]
+
+
+def test_continuing_prefill_yields_only_to_an_off_batch_holder():
+    runner = _slot_runner(3, {"A": object(), "D": object()})
+    runner._req_state_slot = {"D": 0}
+    assert runner._alloc_prefill_state_slots(["A"]) == [1]
+    assert runner._alloc_prefill_state_slots(["A"]) == [1]
+    runner.requests = {"A": object(), "D": object(), "E": object()}
+    assert runner._alloc_prefill_state_slots(["E", "A"]) == [2, 1]

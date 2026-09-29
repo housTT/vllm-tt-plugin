@@ -94,3 +94,39 @@ def test_token_budget_is_left_alone_when_it_already_covers_the_model_len():
     _apply_chunked_prefill_policy(config)
 
     assert config.scheduler_config.max_num_batched_tokens == 32768
+
+
+def test_gpt_oss_keeps_chunked_prefill_with_its_own_default_budget():
+    config = _vllm_config(model_type="gpt_oss", max_num_batched_tokens=2048, max_model_len=131072)
+
+    _apply_chunked_prefill_policy(config)
+
+    assert config.scheduler_config.enable_chunked_prefill is True
+    assert config.scheduler_config.max_num_batched_tokens == 8192
+    assert config.scheduler_config.disable_chunked_mm_input is True
+
+
+def test_gpt_oss_respects_an_explicit_prefill_budget():
+    config = _vllm_config(model_type="gpt_oss", max_num_batched_tokens=4096, max_model_len=131072)
+
+    _apply_chunked_prefill_policy(config)
+
+    assert config.scheduler_config.enable_chunked_prefill is True
+    assert config.scheduler_config.max_num_batched_tokens == 4096
+
+
+def test_gpt_oss_gets_the_prefill_chunk_alignment_knob():
+    from vllm_tt_plugin.platform import _apply_prefill_chunk_alignment
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="gpt_oss")),
+        additional_config={"tt": {"sample_on_device_mode": "all"}},
+    )
+    _apply_prefill_chunk_alignment(config)
+    assert config.additional_config["tt"]["prefill_chunk_alignment"] == 512
+    config.additional_config["tt"]["prefill_chunk_alignment"] = 1024
+    _apply_prefill_chunk_alignment(config)
+    assert config.additional_config["tt"]["prefill_chunk_alignment"] == 1024
+    other = SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="gemma4")), additional_config={})
+    _apply_prefill_chunk_alignment(other)
+    assert other.additional_config == {}

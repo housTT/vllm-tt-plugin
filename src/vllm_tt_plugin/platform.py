@@ -141,7 +141,11 @@ _GALAXY_GENERATOR_VERSIONS = {
 
 # HF ``model_type`` values whose tt-metal generator accepts a ``chunk_start_idx``
 # prefill, i.e. the ones token-chunked prefill has been validated against.
-_CHUNKED_PREFILL_MODEL_TYPES = {"gemma4", "gemma4_unified"}
+_CHUNKED_PREFILL_MODEL_TYPES = {"gemma4", "gemma4_unified", "gpt_oss"}
+
+_CHUNKED_PREFILL_DEFAULT_BUDGET = {"gpt_oss": 8192}
+_VLLM_DEFAULT_MAX_NUM_BATCHED_TOKENS = 2048
+_PREFILL_CHUNK_ALIGNMENT = {"gpt_oss": 512}
 
 
 def _disable_chunked_prefill(vllm_config: "VllmConfig", reason: str) -> None:
@@ -176,10 +180,35 @@ def _disable_chunked_prefill(vllm_config: "VllmConfig", reason: str) -> None:
     scheduler_config.long_prefill_token_threshold = 0
 
 
+def _apply_prefill_chunk_alignment(vllm_config: "VllmConfig") -> None:
+    """Record the model's prefill resume alignment for the scheduler.
+
+    A model whose prefill resumes only on a coarser boundary than the block
+    size would otherwise re-prefill the tokens between a chunk boundary (or a
+    prefix-cache hit) and that boundary on every later chunk, and each chunk
+    would grow past its padded length bucket. The scheduler ends every
+    non-final chunk on a multiple of this value and floors cache hits to it.
+    """
+    model_type = getattr(vllm_config.model_config.hf_config, "model_type", None)
+    alignment = _PREFILL_CHUNK_ALIGNMENT.get(model_type)
+    if alignment is None:
+        return
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    tt_config = additional.get("tt")
+    if not isinstance(tt_config, dict):
+        tt_config = {}
+        additional["tt"] = tt_config
+    tt_config.setdefault("prefill_chunk_alignment", alignment)
+
+
 def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:
     """Restrict token-chunked prefill to the model types that support it."""
     scheduler_config = vllm_config.scheduler_config
     model_type = getattr(vllm_config.model_config.hf_config, "model_type", None)
+    _apply_prefill_chunk_alignment(vllm_config)
 
     if model_type in _CHUNKED_PREFILL_MODEL_TYPES:
         # A chunk boundary inside a multimodal item would split its embeddings
@@ -187,6 +216,20 @@ def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:
         # vLLM rejects the flag outright when one item exceeds the token budget,
         # so it stays off for every model type below.
         scheduler_config.disable_chunked_mm_input = True
+        default_budget = _CHUNKED_PREFILL_DEFAULT_BUDGET.get(model_type)
+        if (
+            default_budget is not None
+            and scheduler_config.enable_chunked_prefill
+            and scheduler_config.max_num_batched_tokens == _VLLM_DEFAULT_MAX_NUM_BATCHED_TOKENS
+        ):
+            logger.info(
+                "Chunked prefill for %s: max_num_batched_tokens left at vLLM's "
+                "default %d, using the model's %d-token chunks.",
+                model_type,
+                scheduler_config.max_num_batched_tokens,
+                default_budget,
+            )
+            scheduler_config.max_num_batched_tokens = default_budget
         return
 
     _disable_chunked_prefill(vllm_config, f"`model_type={model_type}`")
@@ -1620,13 +1663,6 @@ class TTPlatform(Platform):
                     "Prefix caching is not supported in TT backend for %s, "
                     "disabling it",
                     model_class.__module__,
-                )
-                _renormalize_mamba_cache_config(vllm_config)
-            elif model_config.get_sliding_window() is not None:
-                vllm_config.cache_config.enable_prefix_caching = False
-                logger.warning(
-                    "Prefix caching is not supported in TT backend for "
-                    "models with sliding window, disabling it"
                 )
                 _renormalize_mamba_cache_config(vllm_config)
         logger.info(

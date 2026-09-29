@@ -924,8 +924,10 @@ class TTModelRunner:
 
     def _alloc_prefill_state_slots(self, row_req_ids: list[str]) -> list[int]:
         """Pick each prefilling request's state slot, skipping slots that live
-        off-batch requests own. Prefers its own row (where it decodes), so the
-        steady state moves nothing.
+        off-batch requests own. A request that already holds a slot (a chunked
+        prefill continuation) keeps it, because device state written by its
+        earlier chunks lives there; a new request prefers its own row (where it
+        decodes), so the steady state moves nothing.
 
         Exhaustion is unreachable: holders and prefills are disjoint and both count
         against ``max_num_seqs``, which is ``n_slots``. Getting here means the map has
@@ -944,9 +946,17 @@ class TTModelRunner:
             for req_id, slot in self._req_state_slot.items()
             if req_id not in prefilling and req_id in self.requests
         }
+        continuing: dict[str, int] = {}
+        for req_id in row_req_ids:
+            slot = self._req_state_slot.get(req_id)
+            if slot is not None and req_id in self.requests and slot not in held:
+                continuing[req_id] = slot
+                held.add(slot)
         slots: list[int] = []
         for row, req_id in enumerate(row_req_ids):
-            if row not in held:
+            if req_id in continuing:
+                slot = continuing[req_id]
+            elif row not in held:
                 slot = row
             else:
                 free = [s for s in range(n_slots) if s not in held]
@@ -1306,7 +1316,13 @@ class TTModelRunner:
             # Device sampling advances device RNG state for every row it reads,
             # which an intermediate chunk must not do. Host sampling can hand
             # those rows a generator clone instead.
-            perform_device_sampling = False
+            intermediate_rows = intermediate_prefill_mask.nonzero().view(-1).tolist()
+            if any(
+                input_batch.sampling.generators.get(req_indices[row]) is not None
+                for row in intermediate_rows
+                if row < len(req_indices)
+            ):
+                perform_device_sampling = False
 
         # Populate prompt_tokens and output_tokens if penalties are needed
         # (decode only).
@@ -1392,8 +1408,11 @@ class TTModelRunner:
         # subsumes the batch's condense-move remap.
         input_batch.reset_slot_remap()
         prefill_empty_slots = None
+        prefill_new_rows = None
         slot_remap = None
         if is_prompt:
+            held_before = getattr(self, "_req_state_slot", {})
+            prefill_new_rows = [req_id not in held_before for req_id in row_req_ids]
             prefill_empty_slots = self._alloc_prefill_state_slots(row_req_ids)
         else:
             # Advances the ownership map to the post-gather layout, so the returned
@@ -1430,6 +1449,7 @@ class TTModelRunner:
             # back to ``range(N)`` and a prefill overwrites a decoding request's
             # state. Stateless models ignore it.
             prefill_empty_slots=prefill_empty_slots,
+            prefill_new_rows=prefill_new_rows,
             intermediate_prefill_mask=intermediate_prefill_mask,
         )
 
@@ -1992,6 +2012,8 @@ class TTModelRunner:
                     empty_slots.append(dp_rank * stride + i)
         if empty_slots is not None:
             kwargs["empty_slots"] = list(empty_slots)
+        if model_input.prefill_new_rows is not None:
+            kwargs["new_request_rows"] = list(model_input.prefill_new_rows)
 
         if self.request_specific_rope:
             tt_out, rope_deltas = self.model.prefill_forward(**kwargs)
